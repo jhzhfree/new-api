@@ -38,6 +38,7 @@ func main() {
 	common.SQLitePath = filepath.Join(root, "audit.db")
 	common.IsMasterNode = true
 	constant.StreamingTimeout = 30
+	common.RetryTimes = 3
 	common.RedisEnabled = false
 	common.MemoryCacheEnabled = false
 	if model.InitDB() != nil {

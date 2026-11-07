@@ -253,6 +253,7 @@ func GovernanceEvents(c *gin.Context) {
 		return
 	}
 	c.Header("Cache-Control", "no-store")
+	c.Header("X-Aigw-Events-Version", "1")
 	c.JSON(200, events)
 }
 func GovernanceAcknowledge(c *gin.Context) {
