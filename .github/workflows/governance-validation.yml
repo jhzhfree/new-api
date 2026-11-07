@@ -15,7 +15,7 @@ concurrency:
 jobs:
   execution-boundary:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       GOWORK: 'off'
     steps:
@@ -29,10 +29,8 @@ jobs:
             tokenkit/go.sum
       - name: Race-check execution boundary and service regressions
         run: go test -race ./relay/common ./relay/channel ./relay/channel/openai ./service -count=1
-      # Full controller race validation remains blocked by the upstream
-      # RedisEnabled fixture/cache-worker race documented in the integration plan.
-      - name: Controller functional regressions
-        run: go test ./controller -count=1
+      - name: Controller race regressions
+        run: go test -race ./controller -count=1 -timeout=15m
       - name: Build validation binary (not a release package)
         run: |
           mkdir -p web/dist

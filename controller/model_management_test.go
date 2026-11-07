@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"github.com/bytedance/gopkg/util/gopool"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -32,6 +34,9 @@ import (
 
 func modelManagementDB(t *testing.T, kind, dsn string) *gorm.DB {
 	t.Helper()
+	// Background quota-cache jobs read process configuration. Drain the test
+	// pool before replacing that configuration or closing its database.
+	require.Eventually(t, func() bool { return gopool.WorkerCount() == 0 }, 5*time.Second, time.Millisecond, "background jobs must finish before fixture setup")
 	database, isolatedDSN := newAuditTestDatabase(t, kind, dsn)
 	previousDB, previousLogDB := model.DB, model.LOG_DB
 	previousMain, previousLog := common.MainDatabaseType(), common.LogDatabaseType()
@@ -77,6 +82,7 @@ func modelManagementDB(t *testing.T, kind, dsn string) *gorm.DB {
 	require.NoError(t, database.Raw(query).Scan(&version).Error)
 	t.Logf("database version: %s", version)
 	t.Cleanup(func() {
+		require.Eventually(t, func() bool { return gopool.WorkerCount() == 0 }, 5*time.Second, time.Millisecond, "background jobs must finish before fixture teardown")
 		for _, value := range restoreRatios {
 			require.NoError(t, value.restore(value.value))
 		}
