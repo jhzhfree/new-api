@@ -38,6 +38,7 @@ type governanceExecution struct {
 	info            *relaycommon.RelayInfo
 	succeeded       bool
 	expectedChannel int
+	maxInputTokens  uint
 	maxTokens       uint
 	hasImages       bool
 }
@@ -135,13 +136,31 @@ func GovernanceAdmission() gin.HandlerFunc {
 			c.AbortWithStatus(http.StatusBadRequest)
 			return
 		}
-		digest := sha256.Sum256(append([]byte(channelIDs[0]+"\x00"), raw...))
+		admissionVersions := c.Request.Header.Values("X-Aigw-Admission-Version")
+		inputLimits := c.Request.Header.Values("X-Aigw-Max-Input-Tokens")
+		inputLimit := ""
+		var maxInput uint64
+		fingerprintPrefix := channelIDs[0] + "\x00"
+		if len(admissionVersions) > 0 || len(inputLimits) > 0 {
+			if len(admissionVersions) != 1 || admissionVersions[0] != "2" || len(inputLimits) != 1 {
+				c.AbortWithStatus(http.StatusBadRequest)
+				return
+			}
+			inputLimit = inputLimits[0]
+			maxInput, err = strconv.ParseUint(inputLimit, 10, 32)
+			if err != nil || maxInput < 1 || maxInput > 2000000 || strconv.FormatUint(maxInput, 10) != inputLimit {
+				c.AbortWithStatus(http.StatusBadRequest)
+				return
+			}
+			fingerprintPrefix += "v2\x00" + inputLimit + "\x00"
+		}
+		digest := sha256.Sum256(append([]byte(fingerprintPrefix), raw...))
 		journal, err := model.NewGovernanceJournal(model.DB)
 		if err != nil {
 			c.AbortWithStatus(http.StatusServiceUnavailable)
 			return
 		}
-		execution := &governanceExecution{hasImages: hasImages, maxTokens: maxTokens, expectedChannel: channelID, journal: journal, binding: model.GovernanceBinding{OwnerID: c.GetInt("id"), RequestID: requestIDs[0], AttemptID: attemptIDs[0], Fingerprint: hex.EncodeToString(digest[:])}}
+		execution := &governanceExecution{maxInputTokens: uint(maxInput), hasImages: hasImages, maxTokens: maxTokens, expectedChannel: channelID, journal: journal, binding: model.GovernanceBinding{OwnerID: c.GetInt("id"), RequestID: requestIDs[0], AttemptID: attemptIDs[0], Fingerprint: hex.EncodeToString(digest[:])}}
 		if journal.Prepare(c.Request.Context(), execution.binding) != nil {
 			c.AbortWithStatus(http.StatusConflict)
 			return
@@ -150,7 +169,7 @@ func GovernanceAdmission() gin.HandlerFunc {
 		c.Request.Body = io.NopCloser(bytes.NewReader(raw))
 		c.Request.URL.Path = "/v1/chat/completions"
 		original := c.Writer
-		buffered := &governanceWriter{ResponseWriter: original, header: make(http.Header), status: 200, size: -1, live: streamV2, binding: execution.binding}
+		buffered := &governanceWriter{ResponseWriter: original, header: make(http.Header), status: 200, size: -1, inputLimit: inputLimit, live: streamV2, binding: execution.binding}
 		c.Writer = buffered
 		defer func() { c.Writer = original }()
 		c.Next()
@@ -187,6 +206,10 @@ func GovernanceAdmission() gin.HandlerFunc {
 		}
 		original.Header().Set("Content-Type", buffered.header.Get("Content-Type"))
 		original.Header().Set("Cache-Control", "no-store")
+		if inputLimit != "" {
+			original.Header().Set("X-Aigw-Admission-Version", "2")
+			original.Header().Set("X-Aigw-Input-Limit", inputLimit)
+		}
 		for k, v := range map[string]string{"X-Aigw-Evidence-Version": "1", "X-Aigw-Request-Id": execution.binding.RequestID, "X-Aigw-Attempt-Id": execution.binding.AttemptID, "X-Aigw-Usage-Source": "upstream", "X-Aigw-Physical-Attempts": "1"} {
 			original.Header().Set(k, v)
 		}
@@ -255,6 +278,7 @@ func governanceBodyMatches(body []byte, contentType string, evidence *relaycommo
 
 type governanceWriter struct {
 	gin.ResponseWriter
+	inputLimit              string
 	header                  http.Header
 	body                    bytes.Buffer
 	status, size            int
@@ -303,6 +327,10 @@ func (w *governanceWriter) Write(p []byte) (int, error) {
 				w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
 				w.ResponseWriter.Header().Set("Cache-Control", "no-store")
 				w.ResponseWriter.Header().Set("Trailer", "X-Aigw-Completion")
+				if w.inputLimit != "" {
+					w.ResponseWriter.Header().Set("X-Aigw-Admission-Version", "2")
+					w.ResponseWriter.Header().Set("X-Aigw-Input-Limit", w.inputLimit)
+				}
 				for key, value := range map[string]string{"X-Aigw-Evidence-Version": "2", "X-Aigw-Request-Id": w.binding.RequestID, "X-Aigw-Attempt-Id": w.binding.AttemptID, "X-Aigw-Usage-Source": "upstream", "X-Aigw-Physical-Attempts": "1"} {
 					w.ResponseWriter.Header().Set(key, value)
 				}
@@ -346,6 +374,7 @@ func GovernanceEvents(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
 	c.Header("X-Aigw-Events-Version", "1")
 	c.Header("X-Aigw-Paging-Version", "1")
+	c.Header("X-Aigw-Admission-Version", "2")
 	if len(events) == 100 {
 		c.Header("X-Aigw-Next-Cursor", events[len(events)-1].AttemptID)
 	}

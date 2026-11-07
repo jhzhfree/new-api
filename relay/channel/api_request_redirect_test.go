@@ -8,10 +8,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	appconstant "github.com/QuantumNous/new-api/constant"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
@@ -204,4 +206,58 @@ func TestGovernedWireLimitRejectsBeforeDispatch(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestGovernedInputEstimateBeforeDurableDispatch(t *testing.T) {
+	service.InitHttpClient()
+	original := appconstant.CountToken
+	appconstant.CountToken = false
+	t.Cleanup(func() { appconstant.CountToken = original })
+	const pixel = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+	for _, tc := range []struct {
+		name    string
+		channel int
+		body    string
+	}{
+		{"text", appconstant.ChannelTypeOpenAI, `{"model":"gpt-4o","max_tokens":8,"messages":[{"role":"user","content":"synthetic"}]}`},
+		{"tools", appconstant.ChannelTypeDeepSeek, `{"model":"deepseek-chat","max_tokens":8,"messages":[{"role":"user","content":"synthetic"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}]}`},
+		{"image", appconstant.ChannelTypeOpenAI, `{"model":"gpt-4o","max_tokens":8,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,` + pixel + `"}}]}]}`},
+		{"claude-image", appconstant.ChannelTypeAnthropic, `{"model":"claude-sonnet-4-5","max_tokens":8,"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"` + pixel + `"}}]}]}`},
+	} {
+		for _, ceiling := range []uint{1, 2000} {
+			t.Run(tc.name+"/"+strconv.FormatUint(uint64(ceiling), 10), func(t *testing.T) {
+				var calls, dispatches atomic.Int32
+				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls.Add(1)
+					raw, err := io.ReadAll(r.Body)
+					require.NoError(t, err)
+					assert.Equal(t, tc.body, string(raw))
+					w.WriteHeader(200)
+				}))
+				defer upstream.Close()
+				guard, err := relaycommon.NewDurableSingleAttempt(func() error { dispatches.Add(1); return nil })
+				require.NoError(t, err)
+				info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{ChannelType: tc.channel}, SingleAttempt: guard, GovernanceMaxTokens: 8, GovernanceMaxInputTokens: ceiling}
+				ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+				ctx.Request = httptest.NewRequest("POST", "/relay", nil)
+				req, err := http.NewRequest("POST", upstream.URL, bytes.NewBufferString(tc.body))
+				require.NoError(t, err)
+				res, err := doRequest(ctx, req, info)
+				if ceiling == 1 {
+					require.Error(t, err)
+					require.Nil(t, res)
+					assert.Zero(t, calls.Load())
+					assert.Zero(t, dispatches.Load())
+				} else {
+					require.NoError(t, err)
+					res.Body.Close()
+					assert.Equal(t, int32(1), calls.Load())
+					assert.Equal(t, int32(1), dispatches.Load())
+				}
+			})
+		}
+	}
+	// Local estimation must not fetch external media even if called directly.
+	_, err := relaycommon.GovernedInputEstimate([]byte(`{"model":"gpt-4o","max_tokens":8,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"http://127.0.0.1/private"}}]}]}`), appconstant.ChannelTypeOpenAI)
+	require.Error(t, err)
 }

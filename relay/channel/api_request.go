@@ -477,6 +477,12 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 			if readErr != nil || len(body) > 1<<20 || common.ValidateGovernedOutputBound(body, info.GovernanceMaxTokens) != nil {
 				return nil, errors.New("governed output bound changed")
 			}
+			if info.GovernanceMaxInputTokens > 0 {
+				estimate, countErr := common.GovernedInputEstimate(body, info.ChannelType)
+				if countErr != nil || estimate < 0 || uint(estimate) > info.GovernanceMaxInputTokens {
+					return nil, errors.New("governed input estimate exceeds approval")
+				}
+			}
 			req.Body = io.NopCloser(bytes.NewReader(body))
 			req.ContentLength = int64(len(body))
 			req.GetBody = nil

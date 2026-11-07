@@ -118,19 +118,20 @@ type RelayInfo struct {
 	// aliases never participate in channel selection or upstream routing.
 	BillingModelName string
 
-	RequestURLPath      string
-	RequestHeaders      map[string]string
-	ShouldIncludeUsage  bool
-	GovernanceMaxTokens uint // trusted output ceiling; checked again after protocol conversion
-	DisablePing         bool // 是否禁止向下游发送自定义 Ping
-	ClientWs            *websocket.Conn
-	TargetWs            *websocket.Conn
-	InputAudioFormat    string
-	OutputAudioFormat   string
-	RealtimeTools       []dto.RealTimeTool
-	IsFirstRequest      bool
-	AudioUsage          bool
-	ReasoningEffort     string
+	RequestURLPath           string
+	RequestHeaders           map[string]string
+	ShouldIncludeUsage       bool
+	GovernanceMaxInputTokens uint // trusted local-estimate admission ceiling
+	GovernanceMaxTokens      uint // trusted output ceiling; checked again after protocol conversion
+	DisablePing              bool // 是否禁止向下游发送自定义 Ping
+	ClientWs                 *websocket.Conn
+	TargetWs                 *websocket.Conn
+	InputAudioFormat         string
+	OutputAudioFormat        string
+	RealtimeTools            []dto.RealTimeTool
+	IsFirstRequest           bool
+	AudioUsage               bool
+	ReasoningEffort          string
 	// ReasoningConversion is the suffix-derived reasoning intent attached
 	// after model mapping. Converters read it via ReasoningState().
 	ReasoningConversion *dto.ReasoningConversionState

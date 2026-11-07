@@ -249,6 +249,19 @@ func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 		require.Equal(t, 502, response.Code)
 		require.Equal(t, int32(1), calls.Load(), "unsupported vision channel contacted supplier")
 	}
+	inputRequest := httptest.NewRequest("POST", "/internal/governance/v1/chat/completions", strings.NewReader(`{"model":"governance-model","messages":[{"role":"user","content":"synthetic"}],"max_tokens":8}`))
+	inputRequest.RemoteAddr = "127.0.0.1:12345"
+	for key, value := range map[string]string{"Authorization": "Bearer sk-" + token.Key, "Content-Type": "application/json", "X-Aigw-Channel-Id": "1", "X-Aigw-Request-Id": "InputRequest1234567", "X-Aigw-Attempt-Id": "InputAttempt1234567", "X-Aigw-Admission-Version": "2", "X-Aigw-Max-Input-Tokens": "1"} {
+		inputRequest.Header.Set(key, value)
+	}
+	inputResponse := httptest.NewRecorder()
+	engine.ServeHTTP(inputResponse, inputRequest)
+	require.Equal(t, 502, inputResponse.Code)
+	require.Equal(t, int32(1), calls.Load(), "input ceiling denial contacted supplier")
+	inputAttempt, err := journal.Get(context.Background(), user.Id, "InputAttempt1234567")
+	require.NoError(t, err)
+	require.Equal(t, model.GovernanceCancelled, inputAttempt.State)
+
 	mismatch := call(token.Key, "MismatchedAttempt12345", "2")
 	require.Equal(t, 502, mismatch.Code)
 	require.Equal(t, int32(1), calls.Load())
@@ -386,5 +399,30 @@ func TestGovernanceInlineImageAdmission(t *testing.T) {
 		images, valid := governanceInlineImages(map[string]json.RawMessage{"messages": messages})
 		require.Equal(t, tc.valid, valid)
 		require.Equal(t, tc.valid, images)
+	}
+}
+
+func TestGovernanceInputAdmissionHeaders(t *testing.T) {
+	for _, tc := range []struct{ versions, limits []string }{
+		{nil, []string{"128"}}, {[]string{"2"}, nil}, {[]string{"1"}, []string{"128"}},
+		{[]string{"2", "2"}, []string{"128"}}, {[]string{"2"}, []string{"128", "128"}},
+		{[]string{"2"}, []string{"0"}}, {[]string{"2"}, []string{"0128"}},
+		{[]string{"2"}, []string{"2000001"}}, {[]string{"2"}, []string{"18446744073709551615"}},
+	} {
+		r := gin.New()
+		r.POST("/", GovernanceAdmission(), func(c *gin.Context) { t.Error("invalid input approval reached relay") })
+		req := httptest.NewRequest("POST", "/", strings.NewReader(`{"model":"synthetic","messages":[],"max_tokens":8}`))
+		req.Header.Set("X-Aigw-Channel-Id", "1")
+		req.Header.Set("X-Aigw-Request-Id", "Request_1234567890")
+		req.Header.Set("X-Aigw-Attempt-Id", "Attempt_1234567890")
+		for _, v := range tc.versions {
+			req.Header.Add("X-Aigw-Admission-Version", v)
+		}
+		for _, v := range tc.limits {
+			req.Header.Add("X-Aigw-Max-Input-Tokens", v)
+		}
+		out := httptest.NewRecorder()
+		r.ServeHTTP(out, req)
+		require.Equal(t, http.StatusBadRequest, out.Code)
 	}
 }

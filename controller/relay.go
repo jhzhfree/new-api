@@ -145,6 +145,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		// must not commit headers early or race its bounded stream state.
 		relayInfo.DisablePing = true
 		relayInfo.GovernanceMaxTokens = execution.maxTokens
+		relayInfo.GovernanceMaxInputTokens = execution.maxInputTokens
 		relayInfo.SingleAttempt, err = relaycommon.NewDurableSingleAttempt(func() error {
 			if relayInfo.ChannelMeta == nil || (!governanceChannelSupported(relayInfo.ChannelType) || (execution.hasImages && relayInfo.ChannelType == constant.ChannelTypeDeepSeek)) {
 				return errors.New("unsupported governed channel")
