@@ -235,6 +235,20 @@ func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 		require.Equal(t, int64(5), events[0].TotalTokens)
 	}
 
+	if channelType == constant.ChannelTypeDeepSeek {
+		payload := `{"model":"governance-model","max_tokens":8,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"}}]}]}`
+		request := httptest.NewRequest("POST", "/internal/governance/v1/chat/completions", strings.NewReader(payload))
+		request.RemoteAddr = "127.0.0.1:12345"
+		request.Header.Set("Authorization", "Bearer sk-"+token.Key)
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-Aigw-Channel-Id", "1")
+		request.Header.Set("X-Aigw-Request-Id", "ImageRequest1234567")
+		request.Header.Set("X-Aigw-Attempt-Id", "ImageAttempt1234567")
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, request)
+		require.Equal(t, 502, response.Code)
+		require.Equal(t, int32(1), calls.Load(), "unsupported vision channel contacted supplier")
+	}
 	mismatch := call(token.Key, "MismatchedAttempt12345", "2")
 	require.Equal(t, 502, mismatch.Code)
 	require.Equal(t, int32(1), calls.Load())
@@ -356,5 +370,21 @@ func TestGovernanceClientToolAdmission(t *testing.T) {
 		var body map[string]json.RawMessage
 		require.NoError(t, common.Unmarshal([]byte(tc.body), &body))
 		require.Equal(t, tc.valid, governanceToolsValid(body), tc.body)
+	}
+}
+
+func TestGovernanceInlineImageAdmission(t *testing.T) {
+	const pixel = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+	for _, tc := range []struct {
+		source string
+		valid  bool
+	}{
+		{pixel, true}, {"http://127.0.0.1/private", false}, {"https://example.invalid/image.png", false}, {strings.Replace(pixel, "image/png", "image/jpeg", 1), false}, {pixel + "!", false}, {"data:image/svg+xml;base64,PHN2Zz4=", false},
+	} {
+		messages, err := common.Marshal([]any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "image_url", "image_url": map[string]any{"url": tc.source}}}}})
+		require.NoError(t, err)
+		images, valid := governanceInlineImages(map[string]json.RawMessage{"messages": messages})
+		require.Equal(t, tc.valid, valid)
+		require.Equal(t, tc.valid, images)
 	}
 }

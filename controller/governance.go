@@ -5,9 +5,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"image"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"net"
 	"net/http"
@@ -35,6 +39,7 @@ type governanceExecution struct {
 	succeeded       bool
 	expectedChannel int
 	maxTokens       uint
+	hasImages       bool
 }
 
 // GovernanceTransport runs before authentication. Forwarded headers cannot
@@ -104,7 +109,8 @@ func GovernanceAdmission() gin.HandlerFunc {
 				return
 			}
 		}
-		if !governanceToolsValid(payload) {
+		hasImages, imagesValid := governanceInlineImages(payload)
+		if !imagesValid || !governanceToolsValid(payload) {
 			c.AbortWithStatus(http.StatusBadRequest)
 			return
 		}
@@ -135,7 +141,7 @@ func GovernanceAdmission() gin.HandlerFunc {
 			c.AbortWithStatus(http.StatusServiceUnavailable)
 			return
 		}
-		execution := &governanceExecution{maxTokens: maxTokens, expectedChannel: channelID, journal: journal, binding: model.GovernanceBinding{OwnerID: c.GetInt("id"), RequestID: requestIDs[0], AttemptID: attemptIDs[0], Fingerprint: hex.EncodeToString(digest[:])}}
+		execution := &governanceExecution{hasImages: hasImages, maxTokens: maxTokens, expectedChannel: channelID, journal: journal, binding: model.GovernanceBinding{OwnerID: c.GetInt("id"), RequestID: requestIDs[0], AttemptID: attemptIDs[0], Fingerprint: hex.EncodeToString(digest[:])}}
 		if journal.Prepare(c.Request.Context(), execution.binding) != nil {
 			c.AbortWithStatus(http.StatusConflict)
 			return
@@ -425,4 +431,84 @@ func governanceToolsValid(payload map[string]json.RawMessage) bool {
 		}
 	}
 	return true
+}
+
+// Validate before native token estimation or media conversion: governed requests
+// never fetch arbitrary image URLs and cannot carry unbounded image dimensions.
+func governanceInlineImages(payload map[string]json.RawMessage) (bool, bool) {
+	var messages []struct {
+		Role    string          `json:"role"`
+		Content json.RawMessage `json:"content"`
+	}
+	if common.Unmarshal(payload["messages"], &messages) != nil {
+		return false, false
+	}
+	count, totalBytes := 0, 0
+	var pixels int64
+	for _, message := range messages {
+		content := bytes.TrimSpace(message.Content)
+		if len(content) == 0 {
+			continue
+		}
+		if content[0] != '[' {
+			var text string
+			if common.Unmarshal(content, &text) != nil {
+				return false, false
+			}
+			continue
+		}
+		var parts []struct {
+			Type     string `json:"type"`
+			ImageURL *struct {
+				URL    string `json:"url"`
+				Detail string `json:"detail"`
+			} `json:"image_url"`
+		}
+		if message.Role != "user" || common.Unmarshal(content, &parts) != nil || len(parts) < 1 || len(parts) > 16 {
+			return false, false
+		}
+		for _, part := range parts {
+			if part.Type == "text" {
+				continue
+			}
+			if part.Type != "image_url" || part.ImageURL == nil {
+				return false, false
+			}
+			count++
+			if count > 4 {
+				return false, false
+			}
+			source := part.ImageURL
+			if source.Detail != "" && source.Detail != "auto" && source.Detail != "low" && source.Detail != "high" {
+				return false, false
+			}
+			header, encoded, ok := strings.Cut(source.URL, ",")
+			mime := ""
+			switch header {
+			case "data:image/png;base64":
+				mime = "image/png"
+			case "data:image/jpeg;base64":
+				mime = "image/jpeg"
+			default:
+				return false, false
+			}
+			if !ok || len(encoded) > base64.StdEncoding.EncodedLen(256<<10) || strings.ContainsAny(encoded, "\r\n\t ") {
+				return false, false
+			}
+			raw, err := base64.StdEncoding.Strict().DecodeString(encoded)
+			if err != nil || len(raw) == 0 || len(raw) > 256<<10 {
+				return false, false
+			}
+			cfg, format, err := image.DecodeConfig(bytes.NewReader(raw))
+			if err != nil || "image/"+format != mime || cfg.Width < 1 || cfg.Height < 1 || cfg.Width > 4096 || cfg.Height > 4096 {
+				return false, false
+			}
+			totalBytes += len(raw)
+			pixels += int64(cfg.Width) * int64(cfg.Height)
+			if totalBytes > 512<<10 || pixels > 16*1024*1024 {
+				return false, false
+			}
+		}
+	}
+	return count > 0, true
 }

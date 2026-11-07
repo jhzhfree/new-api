@@ -146,7 +146,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		relayInfo.DisablePing = true
 		relayInfo.GovernanceMaxTokens = execution.maxTokens
 		relayInfo.SingleAttempt, err = relaycommon.NewDurableSingleAttempt(func() error {
-			if relayInfo.ChannelMeta == nil || !governanceChannelSupported(relayInfo.ChannelType) {
+			if relayInfo.ChannelMeta == nil || (!governanceChannelSupported(relayInfo.ChannelType) || (execution.hasImages && relayInfo.ChannelType == constant.ChannelTypeDeepSeek)) {
 				return errors.New("unsupported governed channel")
 			}
 
@@ -213,6 +213,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 		if relayInfo.SingleAttempt != nil && !governanceChannelSupported(channel.Type) {
 			newAPIError = types.NewErrorWithStatusCode(errors.New("unsupported governed channel"), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+			break
+		}
+		if value, ok := c.Get(governanceContextKey); ok && value.(*governanceExecution).hasImages && channel.Type == constant.ChannelTypeDeepSeek {
+			newAPIError = types.NewErrorWithStatusCode(errors.New("governed channel does not support image input"), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 			break
 		}
 		if value, ok := c.Get(governanceContextKey); ok && value.(*governanceExecution).expectedChannel != channel.Id {
