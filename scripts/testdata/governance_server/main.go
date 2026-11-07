@@ -35,7 +35,8 @@ func main() {
 	_ = os.Setenv("LOG_SQL_DSN", "")
 	_ = os.Setenv("GOVERNANCE_SERVICE_USER_ID", "7")
 	_ = os.Setenv("GOVERNANCE_ALLOW_LOOPBACK_HTTP", "true")
-	common.SQLitePath = filepath.Join(root, "audit.db")
+	// Preserve the production SQLite WAL, busy timeout and immediate write lock.
+	common.SQLitePath = filepath.Join(root, "audit.db") + "?_pragma=busy_timeout(30000)&_pragma=journal_mode(WAL)&_txlock=immediate"
 	common.IsMasterNode = true
 	constant.StreamingTimeout = 30
 	common.RetryTimes = 3
