@@ -186,11 +186,26 @@ func (j *GovernanceJournal) Get(ctx context.Context, owner int, id string) (*Gov
 }
 
 func (j *GovernanceJournal) Pending(ctx context.Context, owner, limit int) ([]GovernanceEvent, error) {
-	if owner <= 0 || limit < 1 || limit > 100 {
+	return j.PendingAfter(ctx, owner, limit, "")
+}
+
+// PendingAfter uses the existing owner-scoped ordered index. A cursor may be
+// acknowledged but must belong to the same owner. Failed events are never
+// removed just to let a consumer make progress through the rest of the outbox.
+func (j *GovernanceJournal) PendingAfter(ctx context.Context, owner, limit int, after string) ([]GovernanceEvent, error) {
+	if owner <= 0 || limit < 1 || limit > 100 || after != "" && !governanceID.MatchString(after) {
 		return nil, ErrGovernanceInvalid
 	}
+	query := j.db.WithContext(ctx).Where("owner_id = ? AND acknowledged_at = 0", owner)
+	if after != "" {
+		var cursor GovernanceEvent
+		if err := j.db.WithContext(ctx).Where("attempt_id = ? AND owner_id = ?", after, owner).First(&cursor).Error; err != nil {
+			return nil, err
+		}
+		query = query.Where("(created_at > ? OR (created_at = ? AND attempt_id > ?))", cursor.CreatedAt, cursor.CreatedAt, cursor.AttemptID)
+	}
 	var events []GovernanceEvent
-	err := j.db.WithContext(ctx).Where("owner_id = ? AND acknowledged_at = 0", owner).Order("created_at, attempt_id").Limit(limit).Find(&events).Error
+	err := query.Order("created_at, attempt_id").Limit(limit).Find(&events).Error
 	return events, err
 }
 

@@ -23,6 +23,7 @@ func SetRelayRouter(router *gin.Engine) {
 	if owner > 0 {
 		governance := router.Group("/internal/governance/v1", controller.GovernanceTransport(os.Getenv("GOVERNANCE_ALLOW_LOOPBACK_HTTP") == "true"), middleware.SystemPerformanceCheck(), middleware.TokenAuth(), controller.GovernancePrincipal(owner))
 		governance.GET("/events", controller.GovernanceEvents)
+		governance.GET("/events/after/:cursor", controller.GovernanceEvents)
 		governance.POST("/events/:id/ack", controller.GovernanceAcknowledge)
 		governance.POST("/attempts/:id/cancel", controller.GovernanceCancel)
 		governance.POST("/chat/completions", controller.GovernanceAdmission(), middleware.ModelRequestRateLimit(), middleware.Distribute(), func(c *gin.Context) { controller.Relay(c, types.RelayFormatOpenAI) })

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"github.com/QuantumNous/new-api/relay/channel"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/gin-gonic/gin"
@@ -253,6 +254,31 @@ func TestGovernanceJournalDatabaseMatrix(t *testing.T) {
 				if final.State == model.GovernanceDispatched {
 					require.Error(t, cancelErr)
 				}
+				// More than one page, identical timestamps, an acknowledged cursor
+				// and owner isolation must all work on the real database engine.
+				var pending []model.GovernanceEvent
+				for i := 0; i < 205; i++ {
+					pending = append(pending, model.GovernanceEvent{AttemptID: fmt.Sprintf("PageAttempt%020d", i), OwnerID: 91, RequestID: fmt.Sprintf("PageRequest%020d", i), State: model.GovernanceCancelled, CreatedAt: 1234})
+				}
+				require.NoError(t, model.DB.Create(&pending).Error)
+				require.NoError(t, model.DB.Create(&model.GovernanceEvent{AttemptID: "zzzzOtherOwner12345", OwnerID: 92, RequestID: "OtherRequest123456", State: model.GovernanceCancelled, CreatedAt: 1234}).Error)
+				page, err := journal.PendingAfter(ctx, 91, 100, "")
+				require.NoError(t, err)
+				require.Len(t, page, 100)
+				require.NoError(t, journal.Acknowledge(ctx, 91, page[99].AttemptID))
+				_, err = journal.PendingAfter(ctx, 92, 100, page[99].AttemptID)
+				require.Error(t, err)
+				next, err := journal.PendingAfter(ctx, 91, 100, page[99].AttemptID)
+				require.NoError(t, err)
+				require.Len(t, next, 100)
+				require.Equal(t, pending[100].AttemptID, next[0].AttemptID)
+				last, err := journal.PendingAfter(ctx, 91, 100, next[99].AttemptID)
+				require.NoError(t, err)
+				require.Len(t, last, 5)
+				require.Equal(t, pending[200].AttemptID, last[0].AttemptID)
+				retry, err := journal.PendingAfter(ctx, 91, 100, "")
+				require.NoError(t, err)
+				require.Equal(t, pending[0].AttemptID, retry[0].AttemptID)
 				_, err = journal.Pending(ctx, 7, 0)
 				require.ErrorIs(t, err, model.ErrGovernanceInvalid)
 				sqlDB, err = model.DB.DB()

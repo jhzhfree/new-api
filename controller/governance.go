@@ -328,13 +328,17 @@ func GovernanceEvents(c *gin.Context) {
 		c.AbortWithStatus(503)
 		return
 	}
-	events, err := journal.Pending(c.Request.Context(), c.GetInt("id"), 100)
+	events, err := journal.PendingAfter(c.Request.Context(), c.GetInt("id"), 100, c.Param("cursor"))
 	if err != nil {
 		c.AbortWithStatus(503)
 		return
 	}
 	c.Header("Cache-Control", "no-store")
 	c.Header("X-Aigw-Events-Version", "1")
+	c.Header("X-Aigw-Paging-Version", "1")
+	if len(events) == 100 {
+		c.Header("X-Aigw-Next-Cursor", events[len(events)-1].AttemptID)
+	}
 	c.JSON(200, events)
 }
 func GovernanceAcknowledge(c *gin.Context) {
