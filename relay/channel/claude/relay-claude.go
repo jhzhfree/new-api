@@ -332,6 +332,8 @@ func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, clau
 }
 
 func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (*dto.Usage, *types.NewAPIError) {
+	info.UpstreamUsageEvidence = nil
+	evidence := &claudeUsageEvidence{}
 	claudeInfo := &ClaudeResponseInfo{
 		ResponseId:   helper.GetResponseID(c),
 		Created:      common.GetTimestamp(),
@@ -341,6 +343,9 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 	}
 	var err *types.NewAPIError
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
+		if info.SingleAttempt != nil {
+			evidence.observe([]byte(data))
+		}
 		err = HandleStreamResponseData(c, info, claudeInfo, data)
 		if err != nil {
 			sr.Stop(err)
@@ -351,6 +356,10 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 		return nil, err
 	}
 
+	outcome := info.StreamStatus.OutcomeSnapshot()
+	if info.SingleAttempt != nil {
+		info.UpstreamUsageEvidence = evidence.result(!outcome.HasErrors && outcome.Response == relaycommon.ResponseOutcomeCompleted && resp.StatusCode == http.StatusOK)
+	}
 	HandleStreamFinalResponse(c, info, claudeInfo)
 	return claudeInfo.Usage, nil
 }
@@ -439,6 +448,7 @@ func HandleClaudeResponseData(c *gin.Context, info *relaycommon.RelayInfo, claud
 }
 
 func ClaudeHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (*dto.Usage, *types.NewAPIError) {
+	info.UpstreamUsageEvidence = nil
 	defer service.CloseResponseBodyGracefully(resp)
 
 	claudeInfo := &ClaudeResponseInfo{
@@ -453,6 +463,9 @@ func ClaudeHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayI
 		return nil, types.NewError(err, types.ErrorCodeBadResponseBody)
 	}
 	logger.LogDebug(c, "responseBody: %s", responseBody)
+	if info.SingleAttempt != nil && resp.StatusCode == http.StatusOK {
+		info.UpstreamUsageEvidence = claudeJSONEvidence(responseBody)
+	}
 	handleErr := HandleClaudeResponseData(c, info, claudeInfo, resp, responseBody)
 	if handleErr != nil {
 		return nil, handleErr

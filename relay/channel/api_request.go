@@ -1,6 +1,7 @@
 package channel
 
 import (
+	"bytes"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -467,6 +468,19 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	relayClient := *client
 	relayClient.CheckRedirect = keepUpstreamRedirectResponse
 	if info.SingleAttempt != nil {
+		if info.GovernanceMaxTokens > 0 {
+			if req == nil || req.Body == nil {
+				return nil, errors.New("governed request body required")
+			}
+			body, readErr := io.ReadAll(io.LimitReader(req.Body, (1<<20)+1))
+			_ = req.Body.Close()
+			if readErr != nil || len(body) > 1<<20 || common.ValidateGovernedOutputBound(body, info.GovernanceMaxTokens) != nil {
+				return nil, errors.New("governed output bound changed")
+			}
+			req.Body = io.NopCloser(bytes.NewReader(body))
+			req.ContentLength = int64(len(body))
+			req.GetBody = nil
+		}
 		// A fresh HTTP/1 transport avoids pooled-connection and HTTP/2
 		// transparent retries. Do not silently accept a custom round tripper
 		// whose dispatch/replay behavior cannot be established here.

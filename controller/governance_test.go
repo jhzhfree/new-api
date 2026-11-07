@@ -139,6 +139,11 @@ func TestGovernanceStreamBodyEvidence(t *testing.T) {
 }
 
 func TestGovernanceNativeAuthenticatedRelay(t *testing.T) {
+	for _, channelType := range []int{constant.ChannelTypeOpenAI, constant.ChannelTypeDeepSeek, constant.ChannelTypeAnthropic} {
+		t.Run(strconv.Itoa(channelType), func(t *testing.T) { testGovernanceNativeAuthenticatedRelay(t, channelType) })
+	}
+}
+func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 	db := modelManagementDB(t, "sqlite", "")
 	common.IsMasterNode = true
 	require.NoError(t, model.InitDB())
@@ -163,10 +168,22 @@ func TestGovernanceNativeAuthenticatedRelay(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
+		var sent struct {
+			MaxTokens uint `json:"max_tokens"`
+		}
+		require.NoError(t, common.DecodeJson(r.Body, &sent))
+		require.Equal(t, uint(8), sent.MaxTokens)
+		require.NotContains(t, r.Header.Get("Authorization"), token.Key)
+		if channelType == constant.ChannelTypeAnthropic {
+			require.Equal(t, "/v1/messages", r.URL.Path)
+			require.Equal(t, "syntheticvendor", r.Header.Get("x-api-key"))
+			_, _ = w.Write([]byte(`{"id":"synthetic","type":"message","role":"assistant","model":"governance-model","content":[{"type":"text","text":"synthetic"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3,"cache_read_input_tokens":4,"cache_creation_input_tokens":5}}`))
+			return
+		}
 		_, _ = w.Write([]byte(`{"id":"synthetic","object":"chat.completion","model":"governance-model","choices":[{"index":0,"message":{"role":"assistant","content":"synthetic"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`))
 	}))
 	defer upstream.Close()
-	channel := model.Channel{Name: "governance-synthetic", Type: constant.ChannelTypeOpenAI, Key: "syntheticvendor", Status: common.ChannelStatusEnabled, Group: "default", Models: "governance-model", BaseURL: &upstream.URL}
+	channel := model.Channel{Name: "governance-synthetic", Type: channelType, Key: "syntheticvendor", Status: common.ChannelStatusEnabled, Group: "default", Models: "governance-model", BaseURL: &upstream.URL}
 	require.NoError(t, db.Create(&channel).Error)
 	require.NoError(t, db.Create(&model.Ability{ChannelId: channel.Id, Model: "governance-model", Group: "default", Enabled: true}).Error)
 	t.Setenv("GOVERNANCE_SERVICE_USER_ID", strconv.Itoa(user.Id))
@@ -210,7 +227,12 @@ func TestGovernanceNativeAuthenticatedRelay(t *testing.T) {
 	events, err := journal.Pending(context.Background(), user.Id, 100)
 	require.NoError(t, err)
 	require.Len(t, events, 1)
-	require.Equal(t, int64(5), events[0].TotalTokens)
+	if channelType == constant.ChannelTypeAnthropic {
+		require.Equal(t, int64(11), events[0].PromptTokens)
+		require.Equal(t, int64(14), events[0].TotalTokens)
+	} else {
+		require.Equal(t, int64(5), events[0].TotalTokens)
+	}
 
 	mismatch := call(token.Key, "MismatchedAttempt12345", "2")
 	require.Equal(t, 502, mismatch.Code)
@@ -237,7 +259,7 @@ func TestGovernanceNativeAuthenticatedRelay(t *testing.T) {
 			require.NoError(t, db.Model(&channel).Update(tc.field, "").Error)
 		})
 	}
-	require.NoError(t, db.Model(&channel).Update("type", constant.ChannelTypeAnthropic).Error)
+	require.NoError(t, db.Model(&channel).Update("type", constant.ChannelTypeGemini).Error)
 	unsupported := call(token.Key, "UnsupportedAttempt12345")
 	require.Equal(t, 502, unsupported.Code)
 	require.Equal(t, int32(1), calls.Load())

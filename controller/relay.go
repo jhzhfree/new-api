@@ -144,8 +144,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		// Governed output is owned by the completion writer; background pings
 		// must not commit headers early or race its bounded stream state.
 		relayInfo.DisablePing = true
+		relayInfo.GovernanceMaxTokens = execution.maxTokens
 		relayInfo.SingleAttempt, err = relaycommon.NewDurableSingleAttempt(func() error {
-			if relayInfo.ChannelMeta == nil || relayInfo.ChannelType != constant.ChannelTypeOpenAI {
+			if relayInfo.ChannelMeta == nil || !governanceChannelSupported(relayInfo.ChannelType) {
 				return errors.New("unsupported governed channel")
 			}
 
@@ -210,7 +211,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			newAPIError = channelErr
 			break
 		}
-		if relayInfo.SingleAttempt != nil && channel.Type != constant.ChannelTypeOpenAI {
+		if relayInfo.SingleAttempt != nil && !governanceChannelSupported(channel.Type) {
 			newAPIError = types.NewErrorWithStatusCode(errors.New("unsupported governed channel"), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 			break
 		}

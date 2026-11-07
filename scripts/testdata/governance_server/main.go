@@ -59,7 +59,17 @@ func main() {
 		user := model.User{Id: 7, Username: "governance-fixture", Status: common.UserStatusEnabled, Group: "default", Quota: 100000000, Setting: `{"billing_preference":"wallet_only"}`}
 		token := model.Token{UserId: 7, Key: "syntheticgovernancefixture", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
 		base := upstream.String()
-		channel := model.Channel{Name: "synthetic", Type: constant.ChannelTypeOpenAI, Key: "syntheticvendor", Status: common.ChannelStatusEnabled, Group: "default", Models: "governance-model", BaseURL: &base}
+		channelType := constant.ChannelTypeOpenAI
+		switch os.Getenv("GOVERNANCE_FIXTURE_PROTOCOL") {
+		case "", "openai":
+		case "deepseek":
+			channelType = constant.ChannelTypeDeepSeek
+		case "anthropic":
+			channelType = constant.ChannelTypeAnthropic
+		default:
+			os.Exit(13)
+		}
+		channel := model.Channel{Name: "synthetic", Type: channelType, Key: "syntheticvendor", Status: common.ChannelStatusEnabled, Group: "default", Models: "governance-model", BaseURL: &base}
 		if model.DB.Create(&user).Error != nil || model.DB.Create(&token).Error != nil || model.DB.Create(&channel).Error != nil {
 			os.Exit(5)
 		}

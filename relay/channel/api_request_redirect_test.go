@@ -169,3 +169,39 @@ func TestSingleAttemptHTTPExecutionNeverReplays(t *testing.T) {
 		})
 	}
 }
+
+func TestGovernedWireLimitRejectsBeforeDispatch(t *testing.T) {
+	service.InitHttpClient()
+	for _, body := range []string{`{"max_tokens":9}`, `{"max_tokens":0}`, `{}`, `{"max_completion_tokens":9}`, `{"max_tokens":8}`} {
+		t.Run(body, func(t *testing.T) {
+			var calls, dispatches atomic.Int32
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				payload, err := io.ReadAll(r.Body)
+				require.NoError(t, err)
+				require.Equal(t, body, string(payload))
+				w.WriteHeader(200)
+			}))
+			defer upstream.Close()
+			guard, err := relaycommon.NewDurableSingleAttempt(func() error { dispatches.Add(1); return nil })
+			require.NoError(t, err)
+			info := &relaycommon.RelayInfo{ChannelMeta: &relaycommon.ChannelMeta{}, SingleAttempt: guard, GovernanceMaxTokens: 8}
+			ctx, _ := gin.CreateTestContext(httptest.NewRecorder())
+			ctx.Request = httptest.NewRequest(http.MethodPost, "/relay", nil)
+			req, err := http.NewRequest(http.MethodPost, upstream.URL, bytes.NewBufferString(body))
+			require.NoError(t, err)
+			response, err := doRequest(ctx, req, info)
+			if body == `{"max_tokens":8}` {
+				require.NoError(t, err)
+				response.Body.Close()
+				require.Equal(t, int32(1), calls.Load())
+				require.Equal(t, int32(1), dispatches.Load())
+			} else {
+				require.Error(t, err)
+				require.Nil(t, response)
+				require.Zero(t, calls.Load())
+				require.Zero(t, dispatches.Load())
+			}
+		})
+	}
+}

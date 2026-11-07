@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	"github.com/gin-gonic/gin"
@@ -33,6 +34,7 @@ type governanceExecution struct {
 	info            *relaycommon.RelayInfo
 	succeeded       bool
 	expectedChannel int
+	maxTokens       uint
 }
 
 // GovernanceTransport runs before authentication. Forwarded headers cannot
@@ -102,6 +104,11 @@ func GovernanceAdmission() gin.HandlerFunc {
 				return
 			}
 		}
+		var maxTokens uint
+		if common.Unmarshal(payload["max_tokens"], &maxTokens) != nil || maxTokens == 0 || maxTokens > 1000000 {
+			c.AbortWithStatus(http.StatusBadRequest)
+			return
+		}
 		var stream bool
 		if value := payload["stream"]; len(value) > 0 && common.Unmarshal(value, &stream) != nil {
 			c.AbortWithStatus(http.StatusBadRequest)
@@ -124,7 +131,7 @@ func GovernanceAdmission() gin.HandlerFunc {
 			c.AbortWithStatus(http.StatusServiceUnavailable)
 			return
 		}
-		execution := &governanceExecution{expectedChannel: channelID, journal: journal, binding: model.GovernanceBinding{OwnerID: c.GetInt("id"), RequestID: requestIDs[0], AttemptID: attemptIDs[0], Fingerprint: hex.EncodeToString(digest[:])}}
+		execution := &governanceExecution{maxTokens: maxTokens, expectedChannel: channelID, journal: journal, binding: model.GovernanceBinding{OwnerID: c.GetInt("id"), RequestID: requestIDs[0], AttemptID: attemptIDs[0], Fingerprint: hex.EncodeToString(digest[:])}}
 		if journal.Prepare(c.Request.Context(), execution.binding) != nil {
 			c.AbortWithStatus(http.StatusConflict)
 			return
@@ -372,4 +379,13 @@ func GovernanceCancel(c *gin.Context) {
 		return
 	}
 	c.Status(204)
+}
+
+func governanceChannelSupported(channelType int) bool {
+	switch channelType {
+	case constant.ChannelTypeOpenAI, constant.ChannelTypeDeepSeek, constant.ChannelTypeAnthropic:
+		return true
+	default:
+		return false
+	}
 }
