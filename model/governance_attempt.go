@@ -26,34 +26,40 @@ var governanceDigest = regexp.MustCompile(`^[a-f0-9]{64}$`)
 // Attempt IDs are permanent fences: do not purge them without an admission-expiry
 // protocol that prevents late requests from recreating a deleted attempt.
 type GovernanceAttempt struct {
-	ID               string `gorm:"size:64;primaryKey"`
-	OwnerID          int    `gorm:"not null;index"`
-	RequestID        string `gorm:"size:64;not null"`
-	Fingerprint      string `gorm:"size:64;not null"`
-	State            string `gorm:"size:16;not null"`
-	ChannelID        int
-	Model            string `gorm:"size:128"`
-	PromptTokens     int64
-	CompletionTokens int64
-	TotalTokens      int64
-	CreatedAt        int64 `gorm:"autoCreateTime:milli"`
-	UpdatedAt        int64 `gorm:"autoUpdateTime:milli"`
+	ID                  string `gorm:"size:64;primaryKey"`
+	OwnerID             int    `gorm:"not null;index"`
+	RequestID           string `gorm:"size:64;not null"`
+	Fingerprint         string `gorm:"size:64;not null"`
+	State               string `gorm:"size:16;not null"`
+	ChannelID           int
+	Model               string `gorm:"size:128"`
+	CacheDetailsVersion int    `gorm:"not null;default:0"`
+	CacheReadTokens     int64  `gorm:"not null;default:0"`
+	CacheWriteTokens    int64  `gorm:"not null;default:0"`
+	PromptTokens        int64
+	CompletionTokens    int64
+	TotalTokens         int64
+	CreatedAt           int64 `gorm:"autoCreateTime:milli"`
+	UpdatedAt           int64 `gorm:"autoUpdateTime:milli"`
 }
 
 // GovernanceEvent is the durable outbox. A consumer acknowledges it only after
 // committing its own idempotent ledger transaction. Delivery is at least once.
 type GovernanceEvent struct {
-	AttemptID        string `gorm:"size:64;primaryKey;index:idx_governance_pending,priority:4"`
-	OwnerID          int    `gorm:"not null;index:idx_governance_pending,priority:1"`
-	RequestID        string `gorm:"size:64;not null"`
-	State            string `gorm:"size:16;not null"`
-	ChannelID        int
-	Model            string `gorm:"size:128"`
-	PromptTokens     int64
-	CompletionTokens int64
-	TotalTokens      int64
-	CreatedAt        int64 `gorm:"autoCreateTime:milli;index:idx_governance_pending,priority:3"`
-	AcknowledgedAt   int64 `gorm:"not null;index:idx_governance_pending,priority:2"`
+	AttemptID           string `gorm:"size:64;primaryKey;index:idx_governance_pending,priority:4"`
+	OwnerID             int    `gorm:"not null;index:idx_governance_pending,priority:1"`
+	RequestID           string `gorm:"size:64;not null"`
+	State               string `gorm:"size:16;not null"`
+	ChannelID           int
+	Model               string `gorm:"size:128"`
+	CacheDetailsVersion int    `gorm:"not null;default:0"`
+	CacheReadTokens     int64  `gorm:"not null;default:0"`
+	CacheWriteTokens    int64  `gorm:"not null;default:0"`
+	PromptTokens        int64
+	CompletionTokens    int64
+	TotalTokens         int64
+	CreatedAt           int64 `gorm:"autoCreateTime:milli;index:idx_governance_pending,priority:3"`
+	AcknowledgedAt      int64 `gorm:"not null;index:idx_governance_pending,priority:2"`
 }
 
 type GovernanceBinding struct {
@@ -106,8 +112,17 @@ func (j *GovernanceJournal) Dispatch(ctx context.Context, b GovernanceBinding, c
 }
 
 func (j *GovernanceJournal) Complete(ctx context.Context, b GovernanceBinding, prompt, completion, total int64) error {
+	return j.CompleteDetailed(ctx, b, prompt, completion, total, 0, 0, 0)
+}
+
+// CompleteDetailed persists bounded original cache facts atomically with the outbox.
+// Version zero means unavailable, never an inferred zero-cache observation.
+func (j *GovernanceJournal) CompleteDetailed(ctx context.Context, b GovernanceBinding, prompt, completion, total int64, version int, read, write int64) error {
 	const maxTokens = int64(1<<31 - 1)
 	if !b.valid() || prompt < 0 || completion < 0 || total < 0 || prompt > maxTokens || completion > maxTokens || total > maxTokens || prompt+completion != total {
+		return ErrGovernanceInvalid
+	}
+	if version < 0 || version > 1 || read < 0 || write < 0 || read > maxTokens || write > maxTokens || read+write > prompt || (version == 0 && (read != 0 || write != 0)) {
 		return ErrGovernanceInvalid
 	}
 	return j.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -119,7 +134,7 @@ func (j *GovernanceJournal) Complete(ctx context.Context, b GovernanceBinding, p
 			return ErrGovernanceConflict
 		}
 		if a.State == GovernanceCompleted {
-			if a.PromptTokens == prompt && a.CompletionTokens == completion && a.TotalTokens == total {
+			if a.PromptTokens == prompt && a.CompletionTokens == completion && a.TotalTokens == total && a.CacheDetailsVersion == version && a.CacheReadTokens == read && a.CacheWriteTokens == write {
 				return nil
 			}
 			return ErrGovernanceConflict
@@ -128,14 +143,14 @@ func (j *GovernanceJournal) Complete(ctx context.Context, b GovernanceBinding, p
 			return ErrGovernanceConflict
 		}
 		result := tx.Model(&GovernanceAttempt{}).Where("id = ? AND state = ?", a.ID, GovernanceDispatched).
-			Updates(map[string]any{"state": GovernanceCompleted, "prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total})
+			Updates(map[string]any{"state": GovernanceCompleted, "prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total, "cache_details_version": version, "cache_read_tokens": read, "cache_write_tokens": write})
 		if result.Error != nil {
 			return result.Error
 		}
 		if result.RowsAffected != 1 {
 			return ErrGovernanceConflict
 		}
-		return tx.Create(&GovernanceEvent{AttemptID: a.ID, OwnerID: a.OwnerID, RequestID: a.RequestID, State: GovernanceCompleted, ChannelID: a.ChannelID, Model: a.Model, PromptTokens: prompt, CompletionTokens: completion, TotalTokens: total}).Error
+		return tx.Create(&GovernanceEvent{AttemptID: a.ID, OwnerID: a.OwnerID, RequestID: a.RequestID, State: GovernanceCompleted, ChannelID: a.ChannelID, Model: a.Model, PromptTokens: prompt, CompletionTokens: completion, TotalTokens: total, CacheDetailsVersion: version, CacheReadTokens: read, CacheWriteTokens: write}).Error
 	})
 }
 

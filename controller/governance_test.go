@@ -166,6 +166,7 @@ func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 	token := model.Token{UserId: user.Id, Key: "syntheticgovernanceservice", Status: common.TokenStatusEnabled, ExpiredTime: -1, RemainQuota: 1000000}
 	require.NoError(t, db.Create(&token).Error)
 	var calls atomic.Int32
+	var omitCache atomic.Bool
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
@@ -181,7 +182,11 @@ func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 			_, _ = w.Write([]byte(`{"id":"synthetic","type":"message","role":"assistant","model":"governance-model","content":[{"type":"text","text":"synthetic"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3,"cache_read_input_tokens":4,"cache_creation_input_tokens":5}}`))
 			return
 		}
-		_, _ = w.Write([]byte(`{"id":"synthetic","object":"chat.completion","model":"governance-model","choices":[{"index":0,"message":{"role":"assistant","content":"synthetic"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`))
+		payload := `{"id":"synthetic","object":"chat.completion","model":"governance-model","choices":[{"index":0,"message":{"role":"assistant","content":"synthetic"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5,"prompt_tokens_details":{"cached_tokens":1,"cached_creation_tokens":0}}}`
+		if omitCache.Load() {
+			payload = strings.ReplaceAll(payload, `,"prompt_tokens_details":{"cached_tokens":1,"cached_creation_tokens":0}`, "")
+		}
+		_, _ = w.Write([]byte(payload))
 	}))
 	defer upstream.Close()
 	channel := model.Channel{Name: "governance-synthetic", Type: channelType, Key: "syntheticvendor", Status: common.ChannelStatusEnabled, Group: "default", Models: "governance-model", BaseURL: &upstream.URL}
@@ -193,6 +198,7 @@ func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 	engine.POST("/v1/chat/completions", middleware.TokenAuth(), func(c *gin.Context) { c.Status(204) })
 	engine.POST("/internal/governance/v1/chat/completions", GovernanceTransport(true), middleware.TokenAuth(), GovernancePrincipal(user.Id), GovernanceAdmission(), middleware.Distribute(), func(c *gin.Context) { Relay(c, types.RelayFormatOpenAI) })
 	engine.GET("/internal/governance/v1/channels/:id/revision", GovernanceTransport(true), middleware.TokenAuth(), GovernancePrincipal(user.Id), GovernanceChannelConfiguration)
+	tariff := true
 	reviewedRevision := ""
 	for _, key := range []string{"invalid", token.Key} {
 		manifestRequest := httptest.NewRequest("GET", "/internal/governance/v1/channels/1/revision", nil)
@@ -220,6 +226,9 @@ func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 		req.RemoteAddr = "127.0.0.1:1234"
 		req.Header.Set("Authorization", "Bearer sk-"+key)
 		req.Header.Set("Content-Type", "application/json")
+		if tariff {
+			req.Header.Set("X-Aigw-Tariff-Version", "1")
+		}
 		req.Header.Set("X-Aigw-Channel-Id", "1")
 		if reviewedRevision != "" {
 			req.Header.Set("X-Aigw-Config-Version", "1")
@@ -248,10 +257,13 @@ func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 	require.Equal(t, "1", out.Header().Get("X-Aigw-Evidence-Version"))
 	require.Equal(t, int32(1), calls.Load())
 	require.Equal(t, reviewedRevision, out.Header().Get("X-Aigw-Channel-Revision"))
+	require.Equal(t, "1", out.Header().Get("X-Aigw-Tariff-Version"))
+	require.Contains(t, out.Body.String(), "cached_creation_tokens")
 	duplicate := call(token.Key, "NativeAttempt12345")
 	require.Equal(t, 409, duplicate.Code)
 	require.Equal(t, int32(1), calls.Load())
 	reviewedRevision = ""
+	tariff = false
 	journal, err := model.NewGovernanceJournal(db)
 	require.NoError(t, err)
 	events, err := journal.Pending(context.Background(), user.Id, 100)
@@ -365,72 +377,96 @@ func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 	rejected = call(token.Key, "RevokedAttempt12345")
 	require.Equal(t, 401, rejected.Code)
 	require.Equal(t, int32(1), calls.Load())
+	if channelType != constant.ChannelTypeAnthropic {
+		require.NoError(t, db.Model(&channel).Update("type", channelType).Error)
+		require.NoError(t, db.Model(&token).Update("status", common.TokenStatusEnabled).Error)
+		omitCache.Store(true)
+		tariff = true
+		attempt := "MissingCache" + common.GetUUID()
+		response := call(token.Key, attempt)
+		require.Equal(t, 502, response.Code)
+		require.Equal(t, int32(2), calls.Load())
+		row, err := journal.Get(context.Background(), user.Id, attempt)
+		require.NoError(t, err)
+		require.Equal(t, model.GovernanceDispatched, row.State)
+	}
+
 }
 
 func TestGovernanceLiveStreamCommitsBeforeTerminal(t *testing.T) {
 	db := modelManagementDB(t, "sqlite", "")
 	require.NoError(t, db.AutoMigrate(&model.GovernanceAttempt{}, &model.GovernanceEvent{}))
-	for _, complete := range []bool{true, false} {
-		t.Run(strconv.FormatBool(complete), func(t *testing.T) {
-			release := make(chan struct{})
-			var once sync.Once
-			unblock := func() { once.Do(func() { close(release) }) }
-			defer unblock()
-			r := gin.New()
-			r.Use(func(c *gin.Context) { c.Set("id", 7) })
-			r.POST("/", GovernanceAdmission(), func(c *gin.Context) {
-				value, _ := c.Get(governanceContextKey)
-				x := value.(*governanceExecution)
-				require.NoError(t, x.journal.Dispatch(c.Request.Context(), x.binding, 1, "synthetic"))
-				c.Header("Content-Type", "text/event-stream")
-				_, _ = c.Writer.WriteString("data: {\"choices\":[]}\n\n")
-				c.Writer.Flush()
-				<-release
-				x.info = &relaycommon.RelayInfo{UpstreamUsageEvidence: &relaycommon.UpstreamUsageEvidence{PromptTokens: 2, CompletionTokens: 3, TotalTokens: 5, Complete: complete}}
-				x.succeeded = true
-				_, _ = c.Writer.WriteString("data: {\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}\n\ndata: [DONE]\n\n")
-			})
-			server := httptest.NewServer(r)
-			defer func() { unblock(); server.Close() }()
-			attempt := "LiveStream" + common.GetUUID()
-			req, err := http.NewRequest("POST", server.URL, strings.NewReader(`{"model":"synthetic","messages":[],"max_tokens":8,"stream":true}`))
-			require.NoError(t, err)
-			req.Header.Set("X-Aigw-Stream-Version", "2")
-			req.Header.Set("X-Aigw-Channel-Id", "1")
-			req.Header.Set("X-Aigw-Request-Id", "Request_1234567890")
-			req.Header.Set("X-Aigw-Attempt-Id", attempt)
-			client := &http.Client{Timeout: 3 * time.Second}
-			res, err := client.Do(req)
-			if err != nil {
+	for _, cache := range []bool{false, true} {
+		for _, complete := range []bool{true, false} {
+			t.Run(strconv.FormatBool(cache)+"/"+strconv.FormatBool(complete), func(t *testing.T) {
+				release := make(chan struct{})
+				var once sync.Once
+				unblock := func() { once.Do(func() { close(release) }) }
+				defer unblock()
+				r := gin.New()
+				r.Use(func(c *gin.Context) { c.Set("id", 7) })
+				r.POST("/", GovernanceAdmission(), func(c *gin.Context) {
+					value, _ := c.Get(governanceContextKey)
+					x := value.(*governanceExecution)
+					require.NoError(t, x.journal.Dispatch(c.Request.Context(), x.binding, 1, "synthetic"))
+					c.Header("Content-Type", "text/event-stream")
+					_, _ = c.Writer.WriteString("data: {\"choices\":[]}\n\n")
+					c.Writer.Flush()
+					<-release
+					x.info = &relaycommon.RelayInfo{UpstreamUsageEvidence: &relaycommon.UpstreamUsageEvidence{CacheDetailsVersion: 1, CacheReadTokens: 1, PromptTokens: 2, CompletionTokens: 3, TotalTokens: 5, Complete: complete}}
+					x.succeeded = true
+					_, _ = c.Writer.WriteString("data: {\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}\n\ndata: [DONE]\n\n")
+				})
+				server := httptest.NewServer(r)
+				defer func() { unblock(); server.Close() }()
+				attempt := "LiveStream" + common.GetUUID()
+				req, err := http.NewRequest("POST", server.URL, strings.NewReader(`{"model":"synthetic","messages":[],"max_tokens":8,"stream":true}`))
+				require.NoError(t, err)
+				req.Header.Set("X-Aigw-Stream-Version", "2")
+				if cache {
+					req.Header.Set("X-Aigw-Tariff-Version", "1")
+				}
+				req.Header.Set("X-Aigw-Channel-Id", "1")
+				req.Header.Set("X-Aigw-Request-Id", "Request_1234567890")
+				req.Header.Set("X-Aigw-Attempt-Id", attempt)
+				client := &http.Client{Timeout: 3 * time.Second}
+				res, err := client.Do(req)
+				if err != nil {
+					unblock()
+					t.Fatal(err)
+				}
+				defer res.Body.Close()
+				require.Equal(t, "2", res.Header.Get("X-Aigw-Evidence-Version"))
+				reader := bufio.NewReader(res.Body)
+				first, err := reader.ReadString('\n')
+				require.NoError(t, err)
+				require.Contains(t, first, "choices")
+				journal, err := model.NewGovernanceJournal(db)
+				require.NoError(t, err)
+				before, err := journal.Get(context.Background(), 7, attempt)
+				require.NoError(t, err)
+				require.Equal(t, model.GovernanceDispatched, before.State)
 				unblock()
-				t.Fatal(err)
-			}
-			defer res.Body.Close()
-			require.Equal(t, "2", res.Header.Get("X-Aigw-Evidence-Version"))
-			reader := bufio.NewReader(res.Body)
-			first, err := reader.ReadString('\n')
-			require.NoError(t, err)
-			require.Contains(t, first, "choices")
-			journal, err := model.NewGovernanceJournal(db)
-			require.NoError(t, err)
-			before, err := journal.Get(context.Background(), 7, attempt)
-			require.NoError(t, err)
-			require.Equal(t, model.GovernanceDispatched, before.State)
-			unblock()
-			tail, err := io.ReadAll(reader)
-			require.NoError(t, err)
-			after, err := journal.Get(context.Background(), 7, attempt)
-			require.NoError(t, err)
-			if complete {
-				require.Equal(t, "completed", res.Trailer.Get("X-Aigw-Completion"))
-				require.Contains(t, string(tail), "[DONE]")
-				require.Equal(t, model.GovernanceCompleted, after.State)
-			} else {
-				require.Empty(t, res.Trailer.Get("X-Aigw-Completion"))
-				require.NotContains(t, string(tail), "[DONE]")
-				require.Equal(t, model.GovernanceDispatched, after.State)
-			}
-		})
+				tail, err := io.ReadAll(reader)
+				require.NoError(t, err)
+				after, err := journal.Get(context.Background(), 7, attempt)
+				require.NoError(t, err)
+				if complete {
+					require.Equal(t, "completed", res.Trailer.Get("X-Aigw-Completion"))
+					require.Contains(t, string(tail), "[DONE]")
+					require.Equal(t, model.GovernanceCompleted, after.State)
+					if cache {
+						require.Contains(t, string(tail), `"cached_tokens":1`)
+						require.Equal(t, 1, after.CacheDetailsVersion)
+						require.EqualValues(t, 1, after.CacheReadTokens)
+					}
+				} else {
+					require.Empty(t, res.Trailer.Get("X-Aigw-Completion"))
+					require.NotContains(t, string(tail), "[DONE]")
+					require.Equal(t, model.GovernanceDispatched, after.State)
+				}
+			})
+		}
 	}
 }
 

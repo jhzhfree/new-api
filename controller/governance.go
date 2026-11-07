@@ -39,6 +39,7 @@ type governanceExecution struct {
 	journal          *model.GovernanceJournal
 	info             *relaycommon.RelayInfo
 	succeeded        bool
+	tariff           bool
 	expectedRevision string
 	expectedChannel  int
 	maxInputTokens   uint
@@ -187,13 +188,22 @@ func governanceAdmission(embedding bool) gin.HandlerFunc {
 			common.SetContextKey(c, constant.ContextKeyGovernanceRevisionExpected, expectedRevision)
 			fingerprintPrefix += "config-v1\x00" + expectedRevision + "\x00"
 		}
+		tariff := false
+		if versions := c.Request.Header.Values("X-Aigw-Tariff-Version"); len(versions) > 0 {
+			if len(versions) != 1 || versions[0] != "1" || embedding || (stream && !streamV2) {
+				c.AbortWithStatus(400)
+				return
+			}
+			tariff = true
+			fingerprintPrefix += "tariff-v1\x00"
+		}
 		digest := sha256.Sum256(append([]byte(fingerprintPrefix), raw...))
 		journal, err := model.NewGovernanceJournal(model.DB)
 		if err != nil {
 			c.AbortWithStatus(http.StatusServiceUnavailable)
 			return
 		}
-		execution := &governanceExecution{expectedRevision: expectedRevision, embedding: embedding, maxInputTokens: uint(maxInput), hasImages: hasImages, maxTokens: maxTokens, expectedChannel: channelID, journal: journal, binding: model.GovernanceBinding{OwnerID: c.GetInt("id"), RequestID: requestIDs[0], AttemptID: attemptIDs[0], Fingerprint: hex.EncodeToString(digest[:])}}
+		execution := &governanceExecution{tariff: tariff, expectedRevision: expectedRevision, embedding: embedding, maxInputTokens: uint(maxInput), hasImages: hasImages, maxTokens: maxTokens, expectedChannel: channelID, journal: journal, binding: model.GovernanceBinding{OwnerID: c.GetInt("id"), RequestID: requestIDs[0], AttemptID: attemptIDs[0], Fingerprint: hex.EncodeToString(digest[:])}}
 		if journal.Prepare(c.Request.Context(), execution.binding) != nil {
 			c.AbortWithStatus(http.StatusConflict)
 			return
@@ -205,14 +215,14 @@ func governanceAdmission(embedding bool) gin.HandlerFunc {
 			c.Request.URL.Path = "/v1/embeddings"
 		}
 		original := c.Writer
-		buffered := &governanceWriter{ResponseWriter: original, header: make(http.Header), status: 200, size: -1, inputLimit: inputLimit, revision: expectedRevision, live: streamV2, binding: execution.binding}
+		buffered := &governanceWriter{tariff: tariff, ResponseWriter: original, header: make(http.Header), status: 200, size: -1, inputLimit: inputLimit, revision: expectedRevision, live: streamV2, binding: execution.binding}
 		c.Writer = buffered
 		defer func() { c.Writer = original }()
 		c.Next()
 		c.Writer = original
 		finish, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		if execution.info == nil || !execution.succeeded || buffered.failed || buffered.status != 200 || !governanceBodyMatches(buffered.body.Bytes(), buffered.header.Get("Content-Type"), execution.info.UpstreamUsageEvidence, embedding) {
+		if execution.info == nil || (tariff && (execution.info.UpstreamUsageEvidence == nil || execution.info.UpstreamUsageEvidence.CacheDetailsVersion != 1)) || !execution.succeeded || buffered.failed || buffered.status != 200 || !governanceBodyMatches(buffered.body.Bytes(), buffered.header.Get("Content-Type"), execution.info.UpstreamUsageEvidence, embedding) {
 			// Cancellation only succeeds if dispatch never happened. Otherwise the
 			// durable state stays unknown and the control plane must retain its hold.
 			_ = journal.Cancel(finish, execution.binding)
@@ -225,7 +235,15 @@ func governanceAdmission(embedding bool) gin.HandlerFunc {
 			return
 		}
 		usage := execution.info.UpstreamUsageEvidence
-		if journal.Complete(finish, execution.binding, int64(usage.PromptTokens), int64(usage.CompletionTokens), int64(usage.TotalTokens)) != nil {
+		// Legacy uniform-tariff consumers must keep their original event shape
+		// semantics during data-plane-first upgrades. Details are opt-in.
+		detailVersion, readTokens, writeTokens := 0, int64(0), int64(0)
+		if tariff {
+			detailVersion = usage.CacheDetailsVersion
+			readTokens = usage.CacheReadTokens
+			writeTokens = usage.CacheWriteTokens
+		}
+		if journal.CompleteDetailed(finish, execution.binding, int64(usage.PromptTokens), int64(usage.CompletionTokens), int64(usage.TotalTokens), detailVersion, readTokens, writeTokens) != nil {
 			if buffered.started {
 				_, _ = original.Write([]byte("data: {\"error\":{\"code\":\"governance_commit_failed\"}}\n\n"))
 				original.Flush()
@@ -235,10 +253,29 @@ func governanceAdmission(embedding bool) gin.HandlerFunc {
 			return
 		}
 		if buffered.started {
+			if tariff {
+				priced, err := governancePricedUsage(buffered.usageFrame, usage)
+				if err != nil {
+					_, _ = original.Write([]byte("data: {\"error\":{\"code\":\"governance_usage_invalid\"}}\n\n"))
+					original.Flush()
+					return
+				}
+				_, _ = original.Write(append(append([]byte("data: "), priced...), []byte("\n\n")...))
+			}
 			original.Header().Set("X-Aigw-Completion", "completed")
 			_, _ = original.Write([]byte("data: [DONE]\n\n"))
 			original.Flush()
 			return
+		}
+		if tariff {
+			priced, err := governancePricedUsage(buffered.body.Bytes(), usage)
+			if err != nil {
+				c.AbortWithStatus(502)
+				return
+			}
+			buffered.body.Reset()
+			_, _ = buffered.body.Write(priced)
+			original.Header().Set("X-Aigw-Tariff-Version", "1")
 		}
 		original.Header().Set("Content-Type", buffered.header.Get("Content-Type"))
 		original.Header().Set("Cache-Control", "no-store")
@@ -324,6 +361,8 @@ func governanceBodyMatches(body []byte, contentType string, evidence *relaycommo
 }
 
 type governanceWriter struct {
+	tariff     bool
+	usageFrame []byte
 	gin.ResponseWriter
 	inputLimit              string
 	revision                string
@@ -372,6 +411,9 @@ func (w *governanceWriter) Write(p []byte) (int, error) {
 				continue
 			}
 			if !w.started {
+				if w.tariff {
+					w.ResponseWriter.Header().Set("X-Aigw-Tariff-Version", "1")
+				}
 				w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
 				w.ResponseWriter.Header().Set("Cache-Control", "no-store")
 				w.ResponseWriter.Header().Set("Trailer", "X-Aigw-Completion")
@@ -388,6 +430,22 @@ func (w *governanceWriter) Write(p []byte) (int, error) {
 				}
 				w.ResponseWriter.WriteHeader(200)
 				w.started = true
+			}
+			if w.tariff && strings.HasPrefix(string(line), "data:") {
+				raw := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+				var value map[string]json.RawMessage
+				if common.Unmarshal(raw, &value) != nil {
+					w.failed = true
+					return 0, errors.New("invalid governed usage frame")
+				}
+				if usage, ok := value["usage"]; ok && string(usage) != "null" {
+					if len(w.usageFrame) > 0 {
+						w.failed = true
+						return 0, errors.New("duplicate governed usage frame")
+					}
+					w.usageFrame = append([]byte(nil), raw...)
+					continue
+				}
 			}
 			if _, err = w.ResponseWriter.Write(line); err != nil {
 				w.failed = true
@@ -428,6 +486,7 @@ func GovernanceEvents(c *gin.Context) {
 	c.Header("X-Aigw-Paging-Version", "1")
 	c.Header("X-Aigw-Admission-Version", "2")
 	c.Header("X-Aigw-Embeddings-Version", "1")
+	c.Header("X-Aigw-Tariff-Version", "1")
 	c.Header("X-Aigw-Config-Version", "1")
 	if len(events) == 100 {
 		c.Header("X-Aigw-Next-Cursor", events[len(events)-1].AttemptID)
@@ -617,4 +676,24 @@ func GovernanceChannelConfiguration(c *gin.Context) {
 	c.Header("X-Aigw-Config-Version", "1")
 	c.Header("Cache-Control", "no-store")
 	c.JSON(200, gin.H{"channel_id": id, "revision": revision, "enabled": channel.Status == common.ChannelStatusEnabled})
+}
+
+// Canonical cache facts come from original upstream usage, not converter estimates.
+func governancePricedUsage(raw []byte, usage *relaycommon.UpstreamUsageEvidence) ([]byte, error) {
+	if usage == nil || usage.CacheDetailsVersion != 1 {
+		return nil, errors.New("missing governed cache evidence")
+	}
+	var response map[string]json.RawMessage
+	if common.Unmarshal(raw, &response) != nil || response == nil {
+		return nil, errors.New("invalid governed response")
+	}
+	encoded, err := common.Marshal(map[string]any{
+		"prompt_tokens": usage.PromptTokens, "completion_tokens": usage.CompletionTokens, "total_tokens": usage.TotalTokens,
+		"prompt_tokens_details": map[string]int64{"cached_tokens": usage.CacheReadTokens, "cached_creation_tokens": usage.CacheWriteTokens},
+	})
+	if err != nil {
+		return nil, err
+	}
+	response["usage"] = encoded
+	return common.Marshal(response)
 }

@@ -141,6 +141,12 @@ func captureUpstreamUsage(body []byte, complete bool) *relaycommon.UpstreamUsage
 			Prompt     *int64 `json:"prompt_tokens"`
 			Completion *int64 `json:"completion_tokens"`
 			Total      *int64 `json:"total_tokens"`
+			Hit        *int64 `json:"prompt_cache_hit_tokens"`
+			Miss       *int64 `json:"prompt_cache_miss_tokens"`
+			Details    *struct {
+				Cached *int64 `json:"cached_tokens"`
+				Write  *int64 `json:"cached_creation_tokens"`
+			} `json:"prompt_tokens_details"`
 		} `json:"usage"`
 	}
 	if err := common.Unmarshal(body, &payload); err != nil || payload.Usage == nil {
@@ -156,7 +162,30 @@ func captureUpstreamUsage(body []byte, complete bool) *relaycommon.UpstreamUsage
 		*u.Prompt+*u.Completion != *u.Total {
 		return nil
 	}
+	version := 0
+	var read, write int64
+	if u.Details != nil && u.Details.Write != nil && u.Details.Cached == nil {
+		return nil
+	}
+	if u.Details != nil && u.Details.Cached != nil {
+		version = 1
+		read = *u.Details.Cached
+		if u.Details.Write != nil {
+			write = *u.Details.Write
+		}
+	}
+	if u.Hit != nil || u.Miss != nil {
+		if u.Hit == nil || u.Miss == nil || *u.Hit < 0 || *u.Miss < 0 || *u.Hit > maxTokens || *u.Miss > maxTokens || *u.Hit+*u.Miss != *u.Prompt || (version == 1 && read != *u.Hit) {
+			return nil
+		}
+		version = 1
+		read = *u.Hit
+	}
+	if read < 0 || write < 0 || read > maxTokens || write > maxTokens || read+write > *u.Prompt {
+		return nil
+	}
 	return &relaycommon.UpstreamUsageEvidence{
+		CacheDetailsVersion: version, CacheReadTokens: read, CacheWriteTokens: write,
 		PromptTokens: int(*u.Prompt), CompletionTokens: int(*u.Completion),
 		TotalTokens: int(*u.Total), Complete: complete,
 	}

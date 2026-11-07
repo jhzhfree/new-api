@@ -84,10 +84,13 @@ type TokenCountMeta struct {
 // It is deliberately separate from Usage: normal relay billing can estimate or
 // normalize Usage. This is not proof of exactly-once dispatch or durable settlement.
 type UpstreamUsageEvidence struct {
-	PromptTokens     int
-	CompletionTokens int
-	TotalTokens      int
-	Complete         bool
+	CacheDetailsVersion int
+	CacheReadTokens     int64
+	CacheWriteTokens    int64
+	PromptTokens        int
+	CompletionTokens    int
+	TotalTokens         int
+	Complete            bool
 }
 
 type RelayInfo struct {

@@ -113,7 +113,7 @@ func (e *claudeUsageEvidence) result(complete bool) *relaycommon.UpstreamUsageEv
 		return nil
 	}
 	input := e.input + e.read + e.write
-	return &relaycommon.UpstreamUsageEvidence{PromptTokens: int(input), CompletionTokens: int(e.output), TotalTokens: int(input + e.output), Complete: true}
+	return &relaycommon.UpstreamUsageEvidence{CacheDetailsVersion: 1, CacheReadTokens: e.read, CacheWriteTokens: e.write, PromptTokens: int(input), CompletionTokens: int(e.output), TotalTokens: int(input + e.output), Complete: true}
 }
 func claudeJSONEvidence(data []byte) *relaycommon.UpstreamUsageEvidence {
 	var response struct {
