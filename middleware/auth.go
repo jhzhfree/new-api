@@ -528,6 +528,7 @@ func TokenAuthReadOnly() func(c *gin.Context) {
 
 func TokenAuth() func(c *gin.Context) {
 	governanceOwner, _ := strconv.Atoi(os.Getenv("GOVERNANCE_SERVICE_USER_ID"))
+	channelAdmin, _ := strconv.Atoi(os.Getenv("GOVERNANCE_CHANNEL_ADMIN_USER_ID"))
 	return func(c *gin.Context) {
 		// 先检测是否为ws
 		applyWebSocketSubprotocolAuthorization(c.Request.Header)
@@ -593,6 +594,10 @@ func TokenAuth() func(c *gin.Context) {
 		// A deployment-designated service credential must not accidentally
 		// bypass durable governance via the ordinary public relay endpoints.
 		if governanceOwner > 0 && token.UserId == governanceOwner && !strings.HasPrefix(c.Request.URL.Path, "/internal/governance/v1/") {
+			c.AbortWithStatus(http.StatusForbidden)
+			return
+		}
+		if channelAdmin > 0 && token.UserId == channelAdmin && !strings.HasPrefix(c.Request.URL.Path, "/internal/governance-admin/v1/") {
 			c.AbortWithStatus(http.StatusForbidden)
 			return
 		}

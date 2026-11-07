@@ -342,6 +342,7 @@ func migrateDB() error {
 	err := DB.AutoMigrate(
 		&GovernanceAttempt{},
 		&GovernanceEvent{},
+		&GovernanceChannelChange{},
 		&Channel{},
 		&Token{},
 		&User{},

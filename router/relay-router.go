@@ -20,6 +20,18 @@ func SetRelayRouter(router *gin.Engine) {
 	router.Use(middleware.BodyStorageCleanup()) // 清理请求体存储
 	router.Use(middleware.StatsMiddleware())
 	owner, _ := strconv.Atoi(os.Getenv("GOVERNANCE_SERVICE_USER_ID"))
+	channelAdmin, _ := strconv.Atoi(os.Getenv("GOVERNANCE_CHANNEL_ADMIN_USER_ID"))
+	// A separate dedicated identity has channel administration only. Never
+	// elevate the inference service token or accept browser cookies here.
+	if channelAdmin > 0 && channelAdmin != owner {
+		admin := router.Group("/internal/governance-admin/v1", controller.GovernanceTransport(os.Getenv("GOVERNANCE_ALLOW_LOOPBACK_HTTP") == "true"), middleware.TokenAuth(), controller.GovernancePrincipal(channelAdmin))
+		admin.GET("/channels", controller.GovernanceManagedChannels)
+		admin.GET("/channels/item/:id", controller.GovernanceManagedChannels)
+		admin.GET("/channels/after/:cursor", controller.GovernanceManagedChannels)
+		admin.GET("/changes/:operation", controller.GovernanceManagedChannels)
+		admin.POST("/channels", controller.GovernanceManagedChannels)
+		admin.PUT("/channels/:id", controller.GovernanceManagedChannels)
+	}
 	if owner > 0 {
 		governance := router.Group("/internal/governance/v1", controller.GovernanceTransport(os.Getenv("GOVERNANCE_ALLOW_LOOPBACK_HTTP") == "true"), middleware.SystemPerformanceCheck(), middleware.TokenAuth(), controller.GovernancePrincipal(owner))
 		governance.GET("/channels/:id/revision", controller.GovernanceChannelConfiguration)

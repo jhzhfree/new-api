@@ -316,6 +316,27 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 		if channel.Status != common.ChannelStatusEnabled {
 			return nil, "", pinnedChannelUnavailable(pin, http.StatusForbidden, i18n.MsgDistributorChannelDisabled)
 		}
+		selectGroup := ""
+		if pin.Source == dto.PinSourceGovernance {
+			// Unlike administrator token suffix pins, an enterprise route must
+			// remain within the service identity's permitted native groups/models.
+			groups := []string{retry.TokenGroup}
+			if retry.TokenGroup == "auto" {
+				groups = GetRequestAutoGroups(c, common.GetContextKeyString(c, constant.ContextKeyUserGroup))
+			}
+			for _, group := range groups {
+				if model.IsChannelEnabledForGroupModel(group, modelName, channel.Id) {
+					selectGroup = group
+					break
+				}
+			}
+			if selectGroup == "" {
+				return nil, "", &ChannelSelectError{StatusCode: http.StatusForbidden, Message: "governed_channel_scope_forbidden"}
+			}
+			if retry.TokenGroup == "auto" {
+				common.SetContextKey(c, constant.ContextKeyAutoGroup, selectGroup)
+			}
+		}
 		if ok, kind := model.ChannelSatisfiesFilters(channel, modelName, constraints.Filters); !ok {
 			return nil, "", &ChannelSelectError{
 				StatusCode: http.StatusBadRequest, Code: types.ErrorCode(kind), MessageID: i18n.MsgDistributorNoAvailableChannel,
@@ -323,7 +344,7 @@ func SelectChannelForRequest(c *gin.Context, modelName string, retry *RetryParam
 				FilterKind: kind, Channel: channel,
 			}
 		}
-		return channel, "", nil
+		return channel, selectGroup, nil
 	}
 
 	usingGroup := retry.TokenGroup

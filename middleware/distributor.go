@@ -50,8 +50,8 @@ func Distribute() func(c *gin.Context) {
 			abortWithOpenAiMessage(c, invalidRequestStatus(err), i18n.T(c, i18n.MsgDistributorInvalidRequest, map[string]any{"Error": err.Error()}))
 			return
 		}
-		_, pinned, _ := constraints.ResolvedPin()
-		if !pinned {
+		pin, pinned, _ := constraints.ResolvedPin()
+		if !pinned || pin.Source == taskdto.PinSourceGovernance {
 			// Select a channel for the user
 			// check token model mapping
 			modelLimitEnable := common.GetContextKeyBool(c, constant.ContextKeyTokenModelLimitEnabled)

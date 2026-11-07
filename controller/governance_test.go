@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/i18n"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
@@ -145,6 +146,7 @@ func TestGovernanceNativeAuthenticatedRelay(t *testing.T) {
 	}
 }
 func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
+	require.NoError(t, i18n.Init())
 	previousTimeout := constant.StreamingTimeout
 	constant.StreamingTimeout = 30
 	t.Cleanup(func() { constant.StreamingTimeout = previousTimeout })
@@ -217,6 +219,11 @@ func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 	channel := model.Channel{Name: "governance-synthetic", Type: channelType, Key: "syntheticvendor", Status: common.ChannelStatusEnabled, Group: "default", Models: "governance-model", BaseURL: &upstream.URL}
 	require.NoError(t, db.Create(&channel).Error)
 	require.NoError(t, db.Create(&model.Ability{ChannelId: channel.Id, Model: "governance-model", Group: "default", Enabled: true}).Error)
+	// An unreviewed route has higher priority for the same model. Governance
+	// must deterministically select the reviewed channel instead of random routing.
+	decoy := model.Channel{Name: "unreviewed-priority", Type: channelType, Key: "syntheticwrongvendor", Status: common.ChannelStatusEnabled, Group: "default", Models: "governance-model", BaseURL: &upstream.URL, Priority: common.GetPointer(int64(100))}
+	require.NoError(t, db.Create(&decoy).Error)
+	require.NoError(t, db.Create(&model.Ability{ChannelId: decoy.Id, Model: "governance-model", Group: "default", Enabled: true, Priority: common.GetPointer(int64(100))}).Error)
 	t.Setenv("GOVERNANCE_SERVICE_USER_ID", strconv.Itoa(user.Id))
 	engine := gin.New()
 	engine.Use(middleware.BodyStorageCleanup())
@@ -288,6 +295,14 @@ func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 	rejected := call("invalid", "InvalidAttempt12345")
 	require.Equal(t, 401, rejected.Code)
 	require.Zero(t, calls.Load())
+	require.NoError(t, db.Model(&token).Updates(map[string]any{"model_limits_enabled": true, "model_limits": "different-model"}).Error)
+	require.Equal(t, 502, call(token.Key, "ModelDeniedAttempt12345").Code)
+	require.Zero(t, calls.Load(), "governance pin bypassed token model limits")
+	require.NoError(t, db.Model(&token).Update("model_limits_enabled", false).Error)
+	require.NoError(t, db.Model(&model.Ability{}).Where("channel_id = ?", channel.Id).Update("enabled", false).Error)
+	require.Equal(t, 502, call(token.Key, "ScopeDeniedAttempt12345").Code)
+	require.Zero(t, calls.Load(), "governance pin bypassed channel group/model scope")
+	require.NoError(t, db.Model(&model.Ability{}).Where("channel_id = ?", channel.Id).Update("enabled", true).Error)
 	out := call(token.Key, "NativeAttempt12345")
 	require.Equal(t, 200, out.Code, out.Body.String())
 	require.Equal(t, "1", out.Header().Get("X-Aigw-Evidence-Version"))
@@ -302,6 +317,12 @@ func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 	tariff = false
 	journal, err := model.NewGovernanceJournal(db)
 	require.NoError(t, err)
+	for _, id := range []string{"ModelDeniedAttempt12345", "ScopeDeniedAttempt12345"} {
+		attempt, err := journal.Get(context.Background(), user.Id, id)
+		require.NoError(t, err)
+		require.Equal(t, model.GovernanceCancelled, attempt.State)
+		require.NoError(t, journal.Acknowledge(context.Background(), user.Id, id))
+	}
 	events, err := journal.Pending(context.Background(), user.Id, 100)
 	require.NoError(t, err)
 	require.Len(t, events, 1)
@@ -339,7 +360,7 @@ func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 	require.NoError(t, err)
 	require.Equal(t, model.GovernanceCancelled, inputAttempt.State)
 
-	mismatch := call(token.Key, "MismatchedAttempt12345", "2")
+	mismatch := call(token.Key, "MismatchedAttempt12345", "99999")
 	require.Equal(t, 502, mismatch.Code)
 	require.Equal(t, int32(1), calls.Load())
 	mismatched, err := journal.Get(context.Background(), user.Id, "MismatchedAttempt12345")

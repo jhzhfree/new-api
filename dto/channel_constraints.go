@@ -5,11 +5,13 @@ type ChannelPinSource string
 const (
 	PinSourceToken      ChannelPinSource = "token"       // Rank 0, highest
 	PinSourceOriginTask ChannelPinSource = "origin_task" // Rank 10
+	PinSourceGovernance ChannelPinSource = "governance"  // Internal reviewed route; retains token/group limits.
 )
 
 const (
 	PinRankToken      = 0
 	PinRankOriginTask = 10
+	PinRankGovernance = -10
 )
 
 type PinRetryMode int

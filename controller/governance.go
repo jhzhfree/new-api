@@ -22,8 +22,10 @@ import (
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/dto"
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
+	"github.com/QuantumNous/new-api/service"
 	"github.com/gin-gonic/gin"
 )
 
@@ -221,6 +223,12 @@ func governanceAdmission(embedding bool) gin.HandlerFunc {
 			return
 		}
 		c.Set(governanceContextKey, execution)
+		// The reviewed channel is a selection constraint, not a post-selection
+		// assertion. Retain native model/group permissions for this pin source.
+		service.GetChannelConstraints(c).AddPin(dto.ChannelPin{
+			ChannelId: channelID, Source: dto.PinSourceGovernance,
+			Rank: dto.PinRankGovernance, RetryMode: dto.PinRetrySingleAttempt,
+		})
 		c.Request.Body = io.NopCloser(bytes.NewReader(raw))
 		c.Request.URL.Path = "/v1/chat/completions"
 		if embedding {

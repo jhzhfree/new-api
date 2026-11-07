@@ -100,6 +100,7 @@ func TestGovernanceJournalDatabaseMatrix(t *testing.T) {
 
 				require.True(t, model.DB.Migrator().HasTable(&model.GovernanceAttempt{}))
 				require.True(t, model.DB.Migrator().HasTable(&model.GovernanceEvent{}))
+				require.True(t, model.DB.Migrator().HasTable(&model.GovernanceChannelChange{}))
 				indexes, err := model.DB.Migrator().GetIndexes(&model.GovernanceEvent{})
 				require.NoError(t, err)
 				foundPendingIndex := false

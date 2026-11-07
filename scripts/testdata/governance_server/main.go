@@ -34,6 +34,8 @@ func main() {
 	_ = os.Setenv("SQL_DSN", "local")
 	_ = os.Setenv("LOG_SQL_DSN", "")
 	_ = os.Setenv("GOVERNANCE_SERVICE_USER_ID", "7")
+	_ = os.Setenv("GOVERNANCE_CHANNEL_ADMIN_USER_ID", "8")
+	_ = os.Setenv("GOVERNANCE_CHANNEL_ALLOWED_ORIGINS", upstream.Scheme+"://"+upstream.Host)
 	_ = os.Setenv("GOVERNANCE_ALLOW_LOOPBACK_HTTP", "true")
 	// Preserve the production SQLite WAL, busy timeout and immediate write lock.
 	common.SQLitePath = filepath.Join(root, "audit.db") + "?_pragma=busy_timeout(30000)&_pragma=journal_mode(WAL)&_txlock=immediate"
@@ -57,6 +59,11 @@ func main() {
 		os.Exit(4)
 	}
 	if count == 0 {
+		admin := model.User{Id: 8, Username: "channel-admin", AffCode: "fixture-admin", Status: common.UserStatusEnabled, Group: "default"}
+		adminToken := model.Token{UserId: 8, Key: "syntheticchanneladminfixture", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
+		if model.DB.Create(&admin).Error != nil || model.DB.Create(&adminToken).Error != nil {
+			os.Exit(15)
+		}
 		user := model.User{Id: 7, Username: "governance-fixture", Status: common.UserStatusEnabled, Group: "default", Quota: 100000000, Setting: `{"billing_preference":"wallet_only"}`}
 		token := model.Token{UserId: 7, Key: "syntheticgovernancefixture", Status: common.TokenStatusEnabled, ExpiredTime: -1, UnlimitedQuota: true}
 		base := upstream.String()
