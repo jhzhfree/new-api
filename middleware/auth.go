@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 
@@ -526,6 +527,7 @@ func TokenAuthReadOnly() func(c *gin.Context) {
 }
 
 func TokenAuth() func(c *gin.Context) {
+	governanceOwner, _ := strconv.Atoi(os.Getenv("GOVERNANCE_SERVICE_USER_ID"))
 	return func(c *gin.Context) {
 		// 先检测是否为ws
 		applyWebSocketSubprotocolAuthorization(c.Request.Header)
@@ -585,6 +587,13 @@ func TokenAuth() func(c *gin.Context) {
 				abortWithOpenAiMessage(c, http.StatusUnauthorized,
 					common.TranslateMessage(c, i18n.MsgTokenInvalid))
 			}
+			return
+		}
+
+		// A deployment-designated service credential must not accidentally
+		// bypass durable governance via the ordinary public relay endpoints.
+		if governanceOwner > 0 && token.UserId == governanceOwner && !strings.HasPrefix(c.Request.URL.Path, "/internal/governance/v1/") {
+			c.AbortWithStatus(http.StatusForbidden)
 			return
 		}
 

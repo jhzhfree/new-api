@@ -9,6 +9,7 @@ import (
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -158,8 +159,10 @@ func TestGovernanceNativeAuthenticatedRelay(t *testing.T) {
 	channel := model.Channel{Name: "governance-synthetic", Type: constant.ChannelTypeOpenAI, Key: "syntheticvendor", Status: common.ChannelStatusEnabled, Group: "default", Models: "governance-model", BaseURL: &upstream.URL}
 	require.NoError(t, db.Create(&channel).Error)
 	require.NoError(t, db.Create(&model.Ability{ChannelId: channel.Id, Model: "governance-model", Group: "default", Enabled: true}).Error)
+	t.Setenv("GOVERNANCE_SERVICE_USER_ID", strconv.Itoa(user.Id))
 	engine := gin.New()
 	engine.Use(middleware.BodyStorageCleanup())
+	engine.POST("/v1/chat/completions", middleware.TokenAuth(), func(c *gin.Context) { c.Status(204) })
 	engine.POST("/internal/governance/v1/chat/completions", GovernanceTransport(true), middleware.TokenAuth(), GovernancePrincipal(user.Id), GovernanceAdmission(), middleware.Distribute(), func(c *gin.Context) { Relay(c, types.RelayFormatOpenAI) })
 	call := func(key, attempt string, channelOverride ...string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest("POST", "/internal/governance/v1/chat/completions", strings.NewReader(`{"model":"governance-model","messages":[{"role":"user","content":"synthetic"}],"max_tokens":8}`))
@@ -176,6 +179,12 @@ func TestGovernanceNativeAuthenticatedRelay(t *testing.T) {
 		engine.ServeHTTP(out, req)
 		return out
 	}
+
+	bypass := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	bypass.Header.Set("Authorization", "Bearer sk-"+token.Key)
+	bypassResult := httptest.NewRecorder()
+	engine.ServeHTTP(bypassResult, bypass)
+	require.Equal(t, 403, bypassResult.Code)
 	rejected := call("invalid", "InvalidAttempt12345")
 	require.Equal(t, 401, rejected.Code)
 	require.Zero(t, calls.Load())
