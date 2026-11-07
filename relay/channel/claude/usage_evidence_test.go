@@ -15,6 +15,8 @@ func TestClaudeRawUsageEvidence(t *testing.T) {
 		valid  bool
 	}{
 		{"complete", []string{start, delta, stop}, true},
+		{"client-tool", []string{start, `{"type":"content_block_start","content_block":{"type":"tool_use"}}`, `{"type":"content_block_delta","delta":{"type":"input_json_delta"}}`, delta, stop}, true},
+		{"hosted-tool-without-count", []string{start, `{"type":"content_block_start","content_block":{"type":"server_tool_use"}}`, delta, stop}, false},
 		{"cumulative", []string{start, `{"type":"message_delta","usage":{"output_tokens":2}}`, delta, stop}, true},
 		{"no-stop", []string{start, delta}, false},
 		{"no-final-usage", []string{start, stop}, false},
@@ -44,7 +46,7 @@ func TestClaudeRawUsageEvidence(t *testing.T) {
 		})
 	}
 	require.NotNil(t, claudeJSONEvidence([]byte(`{"type":"message","stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3}}`)))
-	for _, raw := range []string{`{"type":"message","usage":{"input_tokens":2,"output_tokens":3}}`, `{"type":"message","stop_reason":"end_turn","usage":{"input_tokens":2}}`, `{"type":"message","stop_reason":"end_turn","usage":{"input_tokens":1e30,"output_tokens":3}}`} {
+	for _, raw := range []string{`{"type":"message","stop_reason":"end_turn","content":[{"type":"server_tool_use"}],"usage":{"input_tokens":2,"output_tokens":3}}`, `{"type":"message","usage":{"input_tokens":2,"output_tokens":3}}`, `{"type":"message","stop_reason":"end_turn","usage":{"input_tokens":2}}`, `{"type":"message","stop_reason":"end_turn","usage":{"input_tokens":1e30,"output_tokens":3}}`} {
 		require.Nil(t, claudeJSONEvidence([]byte(raw)))
 	}
 }

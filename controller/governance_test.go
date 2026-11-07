@@ -3,6 +3,7 @@ package controller
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/middleware"
@@ -336,5 +337,24 @@ func TestGovernanceLiveStreamCommitsBeforeTerminal(t *testing.T) {
 				require.Equal(t, model.GovernanceDispatched, after.State)
 			}
 		})
+	}
+}
+
+func TestGovernanceClientToolAdmission(t *testing.T) {
+	for _, tc := range []struct {
+		body  string
+		valid bool
+	}{
+		{`{}`, true},
+		{`{"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],"tool_choice":"auto"}`, true},
+		{`{"tools":[{"type":"web_search"}]}`, false},
+		{`{"tools":[{"type":"function","function":{"name":"lookup"}}]}`, false},
+		{`{"tools":[]}`, false},
+		{`{"tool_choice":"auto"}`, false},
+		{`{"tools":[{"type":"function","function":{"name":"lookup","parameters":{}}},{"type":"function","function":{"name":"lookup","parameters":{}}}]}`, false},
+	} {
+		var body map[string]json.RawMessage
+		require.NoError(t, common.Unmarshal([]byte(tc.body), &body))
+		require.Equal(t, tc.valid, governanceToolsValid(body), tc.body)
 	}
 }

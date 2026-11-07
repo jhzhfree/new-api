@@ -98,11 +98,15 @@ func GovernanceAdmission() gin.HandlerFunc {
 		}
 		for key := range payload {
 			switch key {
-			case "model", "messages", "max_tokens", "stream", "stream_options":
+			case "model", "messages", "max_tokens", "stream", "stream_options", "tools", "tool_choice":
 			default:
 				c.AbortWithStatus(http.StatusBadRequest)
 				return
 			}
+		}
+		if !governanceToolsValid(payload) {
+			c.AbortWithStatus(http.StatusBadRequest)
+			return
 		}
 		var maxTokens uint
 		if common.Unmarshal(payload["max_tokens"], &maxTokens) != nil || maxTokens == 0 || maxTokens > 1000000 {
@@ -392,4 +396,33 @@ func governanceChannelSupported(channelType int) bool {
 	default:
 		return false
 	}
+}
+
+// Only client-side functions use the reviewed input/output token tariff.
+// Provider-hosted tools can have extra charges and remain outside this contract.
+func governanceToolsValid(payload map[string]json.RawMessage) bool {
+	var tools []struct {
+		Type     string `json:"type"`
+		Function struct {
+			Name       string                     `json:"name"`
+			Parameters map[string]json.RawMessage `json:"parameters"`
+		} `json:"function"`
+	}
+	if raw, ok := payload["tools"]; ok && (common.Unmarshal(raw, &tools) != nil || len(tools) == 0 || len(tools) > 8) {
+		return false
+	}
+	names := map[string]bool{}
+	for _, tool := range tools {
+		if tool.Type != "function" || len(tool.Function.Name) == 0 || len(tool.Function.Name) > 64 || tool.Function.Parameters == nil || names[tool.Function.Name] {
+			return false
+		}
+		names[tool.Function.Name] = true
+	}
+	if raw, ok := payload["tool_choice"]; ok {
+		var choice string
+		if len(tools) == 0 || common.Unmarshal(raw, &choice) != nil || (choice != "auto" && choice != "none" && choice != "required") {
+			return false
+		}
+	}
+	return true
 }

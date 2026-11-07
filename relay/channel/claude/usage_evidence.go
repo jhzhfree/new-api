@@ -56,7 +56,13 @@ func (e *claudeUsageEvidence) update(u *rawClaudeUsage, initial bool) {
 }
 func (e *claudeUsageEvidence) observe(data []byte) {
 	var frame struct {
-		Type    string `json:"type"`
+		Type         string `json:"type"`
+		ContentBlock *struct {
+			Type string `json:"type"`
+		} `json:"content_block"`
+		Delta *struct {
+			Type string `json:"type"`
+		} `json:"delta"`
 		Message *struct {
 			Usage *rawClaudeUsage `json:"usage"`
 		} `json:"message"`
@@ -89,6 +95,12 @@ func (e *claudeUsageEvidence) observe(data []byte) {
 	case "error":
 		e.bad = true
 	case "content_block_start", "content_block_delta", "content_block_stop", "ping":
+		if frame.Type == "content_block_start" && (frame.ContentBlock == nil || (frame.ContentBlock.Type != "text" && frame.ContentBlock.Type != "tool_use")) {
+			e.bad = true
+		}
+		if frame.Type == "content_block_delta" && (frame.Delta == nil || (frame.Delta.Type != "text_delta" && frame.Delta.Type != "input_json_delta")) {
+			e.bad = true
+		}
 		if !e.started && frame.Type != "ping" {
 			e.bad = true
 		}
@@ -105,12 +117,20 @@ func (e *claudeUsageEvidence) result(complete bool) *relaycommon.UpstreamUsageEv
 }
 func claudeJSONEvidence(data []byte) *relaycommon.UpstreamUsageEvidence {
 	var response struct {
+		Content []struct {
+			Type string `json:"type"`
+		} `json:"content"`
 		Type       string          `json:"type"`
 		StopReason string          `json:"stop_reason"`
 		Usage      *rawClaudeUsage `json:"usage"`
 	}
 	if common.Unmarshal(data, &response) != nil || response.Type != "message" || response.StopReason == "" {
 		return nil
+	}
+	for _, block := range response.Content {
+		if block.Type != "text" && block.Type != "tool_use" {
+			return nil
+		}
 	}
 	evidence := &claudeUsageEvidence{started: true, delta: true, stopped: true}
 	evidence.update(response.Usage, true)
