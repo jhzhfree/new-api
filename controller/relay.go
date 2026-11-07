@@ -141,6 +141,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	if value, ok := c.Get(governanceContextKey); ok {
 		execution := value.(*governanceExecution)
 		execution.info = relayInfo
+		// Governed output is owned by the completion writer; background pings
+		// must not commit headers early or race its bounded stream state.
+		relayInfo.DisablePing = true
 		relayInfo.SingleAttempt, err = relaycommon.NewDurableSingleAttempt(func() error {
 			if relayInfo.ChannelMeta == nil || relayInfo.ChannelType != constant.ChannelTypeOpenAI {
 				return errors.New("unsupported governed channel")
