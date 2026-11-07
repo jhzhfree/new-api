@@ -146,11 +146,15 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		relayInfo.DisablePing = true
 		relayInfo.GovernanceMaxTokens = execution.maxTokens
 		relayInfo.GovernanceMaxInputTokens = execution.maxInputTokens
+		relayInfo.GovernanceEmbedding = execution.embedding
 		relayInfo.SingleAttempt, err = relaycommon.NewDurableSingleAttempt(func() error {
 			if relayInfo.ChannelMeta == nil || (!governanceChannelSupported(relayInfo.ChannelType) || (execution.hasImages && relayInfo.ChannelType == constant.ChannelTypeDeepSeek)) {
 				return errors.New("unsupported governed channel")
 			}
 
+			if execution.embedding && relayInfo.ChannelType != constant.ChannelTypeOpenAI {
+				return errors.New("unsupported governed embedding channel")
+			}
 			if err := relaycommon.ValidateGovernedDispatchConfig(relayInfo); err != nil {
 				return err
 			}

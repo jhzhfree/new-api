@@ -121,6 +121,7 @@ type RelayInfo struct {
 	RequestURLPath           string
 	RequestHeaders           map[string]string
 	ShouldIncludeUsage       bool
+	GovernanceEmbedding      bool
 	GovernanceMaxInputTokens uint // trusted local-estimate admission ceiling
 	GovernanceMaxTokens      uint // trusted output ceiling; checked again after protocol conversion
 	DisablePing              bool // 是否禁止向下游发送自定义 Ping

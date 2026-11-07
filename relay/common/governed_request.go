@@ -118,3 +118,50 @@ func ValidateGovernedDispatchConfig(info *RelayInfo) error {
 	}
 	return nil
 }
+
+// GovernedEmbeddingEstimate accepts only bounded text inputs and float vectors.
+func GovernedEmbeddingEstimate(body []byte, expectedModel string) (int, error) {
+	invalid := errors.New("unsupported governed embedding request")
+	if len(body) > 64<<10 {
+		return 0, invalid
+	}
+	var fields map[string]any
+	if common.Unmarshal(body, &fields) != nil {
+		return 0, invalid
+	}
+	for key := range fields {
+		if key != "model" && key != "input" && key != "encoding_format" && key != "dimensions" {
+			return 0, invalid
+		}
+	}
+	var request dto.EmbeddingRequest
+	if common.Unmarshal(body, &request) != nil || request.Model == "" || (expectedModel != "" && request.Model != expectedModel) ||
+		(request.EncodingFormat != "" && request.EncodingFormat != "float") || (request.Dimensions != nil && (*request.Dimensions < 1 || *request.Dimensions > 4096)) {
+		return 0, invalid
+	}
+	inputs := request.ParseInput()
+	switch input := request.Input.(type) {
+	case string:
+	case []any:
+		if len(input) != len(inputs) {
+			return 0, invalid
+		}
+	default:
+		return 0, invalid
+	}
+	if len(inputs) < 1 || len(inputs) > 16 {
+		return 0, invalid
+	}
+	total := 0
+	for _, input := range inputs {
+		if strings.TrimSpace(input) == "" || len(input) > 16<<10 {
+			return 0, invalid
+		}
+		count := tokenkit.Count(request.Model, input)
+		if count < 0 || count > 8192 {
+			return 0, invalid
+		}
+		total += count
+	}
+	return total, nil
+}

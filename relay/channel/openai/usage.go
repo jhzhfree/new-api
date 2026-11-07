@@ -161,3 +161,28 @@ func captureUpstreamUsage(body []byte, complete bool) *relaycommon.UpstreamUsage
 		TotalTokens: int(*u.Total), Complete: complete,
 	}
 }
+
+// Embeddings define no generated output; absence of completion_tokens is valid
+// only for this protocol, never a substitute for missing Chat usage.
+func captureEmbeddingUsage(body []byte, complete bool) *relaycommon.UpstreamUsageEvidence {
+	var payload struct {
+		Usage map[string]*int64 `json:"usage"`
+	}
+	if common.Unmarshal(body, &payload) != nil {
+		return nil
+	}
+	for key, value := range payload.Usage {
+		if value == nil {
+			return nil
+		}
+		if key != "prompt_tokens" && key != "total_tokens" && key != "completion_tokens" {
+			return nil
+		}
+	}
+	prompt, p := payload.Usage["prompt_tokens"]
+	total, t := payload.Usage["total_tokens"]
+	if !p || !t || prompt == nil || total == nil || *prompt < 1 || *prompt > 1<<31-1 || *total != *prompt || (payload.Usage["completion_tokens"] != nil && *payload.Usage["completion_tokens"] != 0) {
+		return nil
+	}
+	return &relaycommon.UpstreamUsageEvidence{PromptTokens: int(*prompt), TotalTokens: int(*total), Complete: complete}
+}

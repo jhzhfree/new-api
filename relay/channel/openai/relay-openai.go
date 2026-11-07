@@ -260,7 +260,14 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	defer service.CloseResponseBodyGracefully(resp)
 
 	var simpleResponse dto.OpenAITextResponse
-	responseBody, err := io.ReadAll(resp.Body)
+	var responseReader io.Reader = resp.Body
+	if info.GovernanceEmbedding {
+		responseReader = io.LimitReader(resp.Body, (1<<20)+1)
+	}
+	responseBody, err := io.ReadAll(responseReader)
+	if info.GovernanceEmbedding && len(responseBody) > 1<<20 {
+		return nil, types.NewOpenAIError(fmt.Errorf("embedding response too large"), types.ErrorCodeBadResponseBody, http.StatusBadGateway)
+	}
 	if err != nil {
 		return nil, types.NewOpenAIError(err, types.ErrorCodeReadResponseBodyFailed, http.StatusInternalServerError)
 	}
@@ -312,6 +319,9 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 	}
 
 	info.UpstreamUsageEvidence = captureUpstreamUsage(responseBody, resp.StatusCode == http.StatusOK)
+	if info.GovernanceEmbedding {
+		info.UpstreamUsageEvidence = captureEmbeddingUsage(responseBody, resp.StatusCode == http.StatusOK)
+	}
 	usageModified := false
 	if simpleResponse.Usage.PromptTokens == 0 {
 		completionTokens := simpleResponse.Usage.CompletionTokens

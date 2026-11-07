@@ -41,6 +41,7 @@ type governanceExecution struct {
 	maxInputTokens  uint
 	maxTokens       uint
 	hasImages       bool
+	embedding       bool
 }
 
 // GovernanceTransport runs before authentication. Forwarded headers cannot
@@ -75,7 +76,9 @@ func GovernancePrincipal(owner int) gin.HandlerFunc {
 
 // GovernanceAdmission supports buffered v1 and negotiated real-time SSE v2.
 // V2 releases content early, but DONE and the completion trailer require a durable commit.
-func GovernanceAdmission() gin.HandlerFunc {
+func GovernanceAdmission() gin.HandlerFunc          { return governanceAdmission(false) }
+func GovernanceEmbeddingAdmission() gin.HandlerFunc { return governanceAdmission(true) }
+func governanceAdmission(embedding bool) gin.HandlerFunc {
 	slots := make(chan struct{}, 32)
 	return func(c *gin.Context) {
 		select {
@@ -102,29 +105,38 @@ func GovernanceAdmission() gin.HandlerFunc {
 			c.AbortWithStatus(http.StatusBadRequest)
 			return
 		}
-		for key := range payload {
-			switch key {
-			case "model", "messages", "max_tokens", "stream", "stream_options", "tools", "tool_choice":
-			default:
+		var hasImages, stream bool
+		var maxTokens uint
+		if embedding {
+			if _, err := relaycommon.GovernedEmbeddingEstimate(raw, ""); err != nil {
+				c.AbortWithStatus(400)
+				return
+			}
+		} else {
+			for key := range payload {
+				switch key {
+				case "model", "messages", "max_tokens", "stream", "stream_options", "tools", "tool_choice":
+				default:
+					c.AbortWithStatus(http.StatusBadRequest)
+					return
+				}
+			}
+			var imagesValid bool
+			hasImages, imagesValid = governanceInlineImages(payload)
+			if !imagesValid || !governanceToolsValid(payload) {
+				c.AbortWithStatus(http.StatusBadRequest)
+				return
+			}
+			if common.Unmarshal(payload["max_tokens"], &maxTokens) != nil || maxTokens == 0 || maxTokens > 1000000 {
+				c.AbortWithStatus(http.StatusBadRequest)
+				return
+			}
+			if value := payload["stream"]; len(value) > 0 && common.Unmarshal(value, &stream) != nil {
 				c.AbortWithStatus(http.StatusBadRequest)
 				return
 			}
 		}
-		hasImages, imagesValid := governanceInlineImages(payload)
-		if !imagesValid || !governanceToolsValid(payload) {
-			c.AbortWithStatus(http.StatusBadRequest)
-			return
-		}
-		var maxTokens uint
-		if common.Unmarshal(payload["max_tokens"], &maxTokens) != nil || maxTokens == 0 || maxTokens > 1000000 {
-			c.AbortWithStatus(http.StatusBadRequest)
-			return
-		}
-		var stream bool
-		if value := payload["stream"]; len(value) > 0 && common.Unmarshal(value, &stream) != nil {
-			c.AbortWithStatus(http.StatusBadRequest)
-			return
-		}
+
 		streamV2 := stream && c.GetHeader("X-Aigw-Stream-Version") == "2"
 		channelIDs := c.Request.Header.Values("X-Aigw-Channel-Id")
 		if len(channelIDs) != 1 {
@@ -154,13 +166,20 @@ func GovernanceAdmission() gin.HandlerFunc {
 			}
 			fingerprintPrefix += "v2\x00" + inputLimit + "\x00"
 		}
+		if embedding {
+			if inputLimit == "" {
+				c.AbortWithStatus(400)
+				return
+			}
+			fingerprintPrefix += "embeddings\x00"
+		}
 		digest := sha256.Sum256(append([]byte(fingerprintPrefix), raw...))
 		journal, err := model.NewGovernanceJournal(model.DB)
 		if err != nil {
 			c.AbortWithStatus(http.StatusServiceUnavailable)
 			return
 		}
-		execution := &governanceExecution{maxInputTokens: uint(maxInput), hasImages: hasImages, maxTokens: maxTokens, expectedChannel: channelID, journal: journal, binding: model.GovernanceBinding{OwnerID: c.GetInt("id"), RequestID: requestIDs[0], AttemptID: attemptIDs[0], Fingerprint: hex.EncodeToString(digest[:])}}
+		execution := &governanceExecution{embedding: embedding, maxInputTokens: uint(maxInput), hasImages: hasImages, maxTokens: maxTokens, expectedChannel: channelID, journal: journal, binding: model.GovernanceBinding{OwnerID: c.GetInt("id"), RequestID: requestIDs[0], AttemptID: attemptIDs[0], Fingerprint: hex.EncodeToString(digest[:])}}
 		if journal.Prepare(c.Request.Context(), execution.binding) != nil {
 			c.AbortWithStatus(http.StatusConflict)
 			return
@@ -168,6 +187,9 @@ func GovernanceAdmission() gin.HandlerFunc {
 		c.Set(governanceContextKey, execution)
 		c.Request.Body = io.NopCloser(bytes.NewReader(raw))
 		c.Request.URL.Path = "/v1/chat/completions"
+		if embedding {
+			c.Request.URL.Path = "/v1/embeddings"
+		}
 		original := c.Writer
 		buffered := &governanceWriter{ResponseWriter: original, header: make(http.Header), status: 200, size: -1, inputLimit: inputLimit, live: streamV2, binding: execution.binding}
 		c.Writer = buffered
@@ -176,7 +198,7 @@ func GovernanceAdmission() gin.HandlerFunc {
 		c.Writer = original
 		finish, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		if execution.info == nil || !execution.succeeded || buffered.failed || buffered.status != 200 || !governanceBodyMatches(buffered.body.Bytes(), buffered.header.Get("Content-Type"), execution.info.UpstreamUsageEvidence) {
+		if execution.info == nil || !execution.succeeded || buffered.failed || buffered.status != 200 || !governanceBodyMatches(buffered.body.Bytes(), buffered.header.Get("Content-Type"), execution.info.UpstreamUsageEvidence, embedding) {
 			// Cancellation only succeeds if dispatch never happened. Otherwise the
 			// durable state stays unknown and the control plane must retain its hold.
 			_ = journal.Cancel(finish, execution.binding)
@@ -206,6 +228,9 @@ func GovernanceAdmission() gin.HandlerFunc {
 		}
 		original.Header().Set("Content-Type", buffered.header.Get("Content-Type"))
 		original.Header().Set("Cache-Control", "no-store")
+		if embedding {
+			original.Header().Set("X-Aigw-Protocol", "embeddings")
+		}
 		if inputLimit != "" {
 			original.Header().Set("X-Aigw-Admission-Version", "2")
 			original.Header().Set("X-Aigw-Input-Limit", inputLimit)
@@ -220,7 +245,7 @@ func GovernanceAdmission() gin.HandlerFunc {
 
 // governanceBodyMatches rejects normalized/estimated counters, duplicate usage,
 // malformed frames, errors and bytes following DONE before issuing evidence.
-func governanceBodyMatches(body []byte, contentType string, evidence *relaycommon.UpstreamUsageEvidence) bool {
+func governanceBodyMatches(body []byte, contentType string, evidence *relaycommon.UpstreamUsageEvidence, embedding ...bool) bool {
 	if evidence == nil || !evidence.Complete {
 		return false
 	}
@@ -239,6 +264,10 @@ func governanceBodyMatches(body []byte, contentType string, evidence *relaycommo
 		}
 		if frame.Usage == nil {
 			return true
+		}
+		if len(embedding) > 0 && embedding[0] && frame.Usage.Completion == nil {
+			zero := 0
+			frame.Usage.Completion = &zero
 		}
 		u := frame.Usage
 		if seen || u.Prompt == nil || u.Completion == nil || u.Total == nil || *u.Prompt != evidence.PromptTokens || *u.Completion != evidence.CompletionTokens || *u.Total != evidence.TotalTokens {
@@ -375,6 +404,7 @@ func GovernanceEvents(c *gin.Context) {
 	c.Header("X-Aigw-Events-Version", "1")
 	c.Header("X-Aigw-Paging-Version", "1")
 	c.Header("X-Aigw-Admission-Version", "2")
+	c.Header("X-Aigw-Embeddings-Version", "1")
 	if len(events) == 100 {
 		c.Header("X-Aigw-Next-Cursor", events[len(events)-1].AttemptID)
 	}

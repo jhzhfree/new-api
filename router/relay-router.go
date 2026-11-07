@@ -26,6 +26,7 @@ func SetRelayRouter(router *gin.Engine) {
 		governance.GET("/events/after/:cursor", controller.GovernanceEvents)
 		governance.POST("/events/:id/ack", controller.GovernanceAcknowledge)
 		governance.POST("/attempts/:id/cancel", controller.GovernanceCancel)
+		governance.POST("/embeddings", controller.GovernanceEmbeddingAdmission(), middleware.ModelRequestRateLimit(), middleware.Distribute(), func(c *gin.Context) { controller.Relay(c, types.RelayFormatEmbedding) })
 		governance.POST("/chat/completions", controller.GovernanceAdmission(), middleware.ModelRequestRateLimit(), middleware.Distribute(), func(c *gin.Context) { controller.Relay(c, types.RelayFormatOpenAI) })
 	}
 	// https://platform.openai.com/docs/api-reference/introduction

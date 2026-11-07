@@ -32,3 +32,15 @@ func TestGovernedDispatchRejectsPostConversionDrift(t *testing.T) {
 	}
 	require.Error(t, ValidateGovernedDispatchConfig(nil))
 }
+
+func TestGovernedEmbeddingInputBounds(t *testing.T) {
+	for _, body := range []string{`{"model":"approved","input":"synthetic"}`, `{"model":"approved","input":["one","two"],"dimensions":3,"encoding_format":"float"}`} {
+		count, err := GovernedEmbeddingEstimate([]byte(body), "approved")
+		require.NoError(t, err)
+		require.Positive(t, count)
+	}
+	for _, body := range []string{`{"model":"other","input":"synthetic"}`, `{"model":"approved","input":[1,2]}`, `{"model":"approved","input":["one",3]}`, `{"model":"approved","input":""}`, `{"model":"approved","input":"x","encoding_format":"base64"}`, `{"model":"approved","input":"x","dimensions":4097}`, `{"model":"approved","input":"x","max_tokens":8}`} {
+		_, err := GovernedEmbeddingEstimate([]byte(body), "approved")
+		require.Error(t, err)
+	}
+}

@@ -61,7 +61,7 @@ func main() {
 		base := upstream.String()
 		channelType := constant.ChannelTypeOpenAI
 		switch os.Getenv("GOVERNANCE_FIXTURE_PROTOCOL") {
-		case "", "openai":
+		case "", "openai", "embedding":
 		case "deepseek":
 			channelType = constant.ChannelTypeDeepSeek
 		case "anthropic":

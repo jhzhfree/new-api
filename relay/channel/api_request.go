@@ -468,17 +468,20 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	relayClient := *client
 	relayClient.CheckRedirect = keepUpstreamRedirectResponse
 	if info.SingleAttempt != nil {
-		if info.GovernanceMaxTokens > 0 {
+		if info.GovernanceMaxTokens > 0 || info.GovernanceEmbedding {
 			if req == nil || req.Body == nil {
 				return nil, errors.New("governed request body required")
 			}
 			body, readErr := io.ReadAll(io.LimitReader(req.Body, (1<<20)+1))
 			_ = req.Body.Close()
-			if readErr != nil || len(body) > 1<<20 || common.ValidateGovernedOutputBound(body, info.GovernanceMaxTokens) != nil {
+			if readErr != nil || len(body) > 1<<20 || (!info.GovernanceEmbedding && common.ValidateGovernedOutputBound(body, info.GovernanceMaxTokens) != nil) {
 				return nil, errors.New("governed output bound changed")
 			}
 			if info.GovernanceMaxInputTokens > 0 {
 				estimate, countErr := common.GovernedInputEstimate(body, info.ChannelType)
+				if info.GovernanceEmbedding {
+					estimate, countErr = common.GovernedEmbeddingEstimate(body, info.OriginModelName)
+				}
 				if countErr != nil || estimate < 0 || uint(estimate) > info.GovernanceMaxInputTokens {
 					return nil, errors.New("governed input estimate exceeds approval")
 				}
