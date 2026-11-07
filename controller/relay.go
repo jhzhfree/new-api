@@ -151,6 +151,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 				return errors.New("unsupported governed channel")
 			}
 
+			if err := relaycommon.ValidateGovernedDispatchConfig(relayInfo); err != nil {
+				return err
+			}
 			return execution.journal.Dispatch(c.Request.Context(), execution.binding, relayInfo.ChannelId, relayInfo.OriginModelName)
 		})
 		if err != nil {

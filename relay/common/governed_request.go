@@ -108,3 +108,13 @@ func GovernedInputEstimate(body []byte, channelType int) (int, error) {
 	}
 	return total, nil
 }
+
+// ValidateGovernedDispatchConfig rechecks the final runtime configuration after
+// conversion. Original channel settings are checked earlier by the controller.
+func ValidateGovernedDispatchConfig(info *RelayInfo) error {
+	if info == nil || info.ChannelMeta == nil || info.ChannelSetting.TLSInsecureSkipVerify ||
+		len(info.RuntimeHeadersOverride) != 0 || info.IsModelMapped || info.UpstreamModelName != info.OriginModelName {
+		return errors.New("unreviewed governed dispatch configuration")
+	}
+	return nil
+}

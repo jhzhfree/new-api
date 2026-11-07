@@ -269,6 +269,8 @@ func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 	require.NoError(t, err)
 	require.Equal(t, model.GovernanceCancelled, mismatched.State)
 	for _, tc := range []struct{ field, value string }{
+		{"model_mapping", `{"governance-model":"other-model"}`},
+		{"setting", `{"tls_insecure_skip_verify":true}`},
 		{"param_override", `{"max_tokens":100000}`},
 		{"header_override", `{"Authorization":"{incoming_header:Authorization}"}`},
 		{"setting", `{"system_prompt":"unreviewed content"}`},

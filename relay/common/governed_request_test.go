@@ -13,3 +13,22 @@ func TestGovernedOutputBound(t *testing.T) {
 		require.Error(t, ValidateGovernedOutputBound([]byte(body), 8))
 	}
 }
+
+func TestGovernedDispatchRejectsPostConversionDrift(t *testing.T) {
+	for name, change := range map[string]func(*RelayInfo){
+		"runtime headers": func(i *RelayInfo) {
+			i.RuntimeHeadersOverride = map[string]any{"anthropic-beta": "synthetic paid feature"}
+		},
+		"different priced model": func(i *RelayInfo) { i.UpstreamModelName = "other-model" },
+		"mapping flag":           func(i *RelayInfo) { i.IsModelMapped = true },
+		"untrusted TLS":          func(i *RelayInfo) { i.ChannelSetting.TLSInsecureSkipVerify = true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			info := &RelayInfo{OriginModelName: "approved", ChannelMeta: &ChannelMeta{UpstreamModelName: "approved"}}
+			require.NoError(t, ValidateGovernedDispatchConfig(info))
+			change(info)
+			require.Error(t, ValidateGovernedDispatchConfig(info))
+		})
+	}
+	require.Error(t, ValidateGovernedDispatchConfig(nil))
+}
