@@ -143,6 +143,12 @@ func TestGovernanceNativeAuthenticatedRelay(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, sqlDB.Close()) })
 	require.NoError(t, db.AutoMigrate(&model.Log{}))
+	originalModelRatios := ratio_setting.ModelRatio2JSONString()
+	originalGroupRatios := ratio_setting.GroupRatio2JSONString()
+	t.Cleanup(func() {
+		require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(originalModelRatios))
+		require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(originalGroupRatios))
+	})
 	require.NoError(t, ratio_setting.UpdateModelRatioByJSONString(`{"governance-model":1}`))
 	require.NoError(t, ratio_setting.UpdateGroupRatioByJSONString(`{"default":1}`))
 	user := model.User{Username: "governance-service", Status: common.UserStatusEnabled, Group: "default", Quota: 1000000, Setting: `{"billing_preference":"wallet_only"}`}
@@ -208,6 +214,25 @@ func TestGovernanceNativeAuthenticatedRelay(t *testing.T) {
 	mismatched, err := journal.Get(context.Background(), user.Id, "MismatchedAttempt12345")
 	require.NoError(t, err)
 	require.Equal(t, model.GovernanceCancelled, mismatched.State)
+	for _, tc := range []struct{ field, value string }{
+		{"param_override", `{"max_tokens":100000}`},
+		{"header_override", `{"Authorization":"{incoming_header:Authorization}"}`},
+		{"setting", `{"system_prompt":"unreviewed content"}`},
+		{"setting", `{"pass_through_body_enabled":true}`},
+		{"settings", `{"advanced_custom":{}}`},
+	} {
+		t.Run(tc.field+tc.value, func(t *testing.T) {
+			require.NoError(t, db.Model(&channel).Update(tc.field, tc.value).Error)
+			attempt := "Transform" + common.GetUUID()
+			result := call(token.Key, attempt)
+			require.Equal(t, 502, result.Code)
+			require.Equal(t, int32(1), calls.Load())
+			cancelled, err := journal.Get(context.Background(), user.Id, attempt)
+			require.NoError(t, err)
+			require.Equal(t, model.GovernanceCancelled, cancelled.State)
+			require.NoError(t, db.Model(&channel).Update(tc.field, "").Error)
+		})
+	}
 	require.NoError(t, db.Model(&channel).Update("type", constant.ChannelTypeAnthropic).Error)
 	unsupported := call(token.Key, "UnsupportedAttempt12345")
 	require.Equal(t, 502, unsupported.Code)

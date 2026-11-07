@@ -26,6 +26,7 @@ import (
 	"github.com/QuantumNous/new-api/relaykit/dto"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/service"
+	"github.com/QuantumNous/new-api/setting/model_setting"
 	"github.com/QuantumNous/new-api/setting/operation_setting"
 
 	"github.com/gin-gonic/gin"
@@ -213,6 +214,20 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if value, ok := c.Get(governanceContextKey); ok && value.(*governanceExecution).expectedChannel != channel.Id {
 			newAPIError = types.NewErrorWithStatusCode(errors.New("governed channel binding changed"), types.ErrorCodeInvalidRequest, http.StatusConflict, types.ErrOptionWithSkipRetry())
 			break
+		}
+		if relayInfo.SingleAttempt != nil {
+			settings, _ := common.GetContextKeyType[dto.ChannelSettings](c, constant.ContextKeyChannelSetting)
+			otherSettings, _ := common.GetContextKeyType[dto.ChannelOtherSettings](c, constant.ContextKeyChannelOtherSetting)
+			// Overrides can change the reserved output bound, inject content, or
+			// forward the service credential. Only the reviewed chat path is supported.
+			if len(common.GetContextKeyStringMap(c, constant.ContextKeyChannelParamOverride)) != 0 || len(common.GetContextKeyStringMap(c, constant.ContextKeyChannelHeaderOverride)) != 0 ||
+				settings.SystemPrompt != "" || settings.SystemPromptOverride || settings.PassThroughBodyEnabled ||
+				settings.ForceFormat || settings.ThinkingToContent || otherSettings.AdvancedCustom != nil ||
+				model_setting.GetGlobalSettings().PassThroughRequestEnabled ||
+				service.ShouldChatCompletionsUseResponsesGlobal(channel.Id, channel.Type, relayInfo.OriginModelName) {
+				newAPIError = types.NewErrorWithStatusCode(errors.New("unsupported governed channel transformation"), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+				break
+			}
 		}
 		service.AppendUsedChannel(c, channel.Id)
 		if billingErr := service.PrepareTieredBillingForSelectedGroup(c, relayInfo); billingErr != nil {
