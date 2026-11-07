@@ -1,0 +1,40 @@
+name: Governance integration validation
+
+on:
+  push:
+    branches: [feature/enterprise-governance-integration]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: governance-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  execution-boundary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GOWORK: 'off'
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            relaykit/go.sum
+            tokenkit/go.sum
+      - name: Race-check execution boundary and service regressions
+        run: go test -race ./relay/common ./relay/channel ./relay/channel/openai ./service -count=1
+      # Full controller race validation remains blocked by the upstream
+      # RedisEnabled fixture/cache-worker race documented in the integration plan.
+      - name: Controller functional regressions
+        run: go test ./controller -count=1
+      - name: Build validation binary (not a release package)
+        run: |
+          mkdir -p web/dist
+          touch web/dist/index.html
+          go build -mod=readonly .

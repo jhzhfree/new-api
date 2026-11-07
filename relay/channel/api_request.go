@@ -1,6 +1,7 @@
 package channel
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -465,6 +466,47 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	// transparent stream retries.
 	relayClient := *client
 	relayClient.CheckRedirect = keepUpstreamRedirectResponse
+	if info.SingleAttempt != nil {
+		// A fresh HTTP/1 transport avoids pooled-connection and HTTP/2
+		// transparent retries. Do not silently accept a custom round tripper
+		// whose dispatch/replay behavior cannot be established here.
+		baseTransport := client.Transport
+		if baseTransport == nil {
+			baseTransport = http.DefaultTransport
+		}
+		transport, ok := baseTransport.(*http.Transport)
+		if !ok || transport == nil || transport.DialTLSContext != nil || transport.DialTLS != nil ||
+			(transport.TLSClientConfig != nil && transport.TLSClientConfig.InsecureSkipVerify) ||
+			req == nil || req.Method != http.MethodPost || req.Body == nil {
+			if req != nil && req.Body != nil {
+				_ = req.Body.Close()
+			}
+			return nil, errors.New("unsupported single-attempt HTTP transport")
+		}
+		isolated := transport.Clone()
+		isolated.DisableKeepAlives = true
+		isolated.ForceAttemptHTTP2 = false
+		isolated.Protocols = new(http.Protocols)
+		isolated.Protocols.SetHTTP1(true)
+		// Clone can retain an initialized HTTP/2 ALPN advertisement even
+		// when Protocols has been restricted. Keep TLS negotiation aligned.
+		if isolated.TLSClientConfig == nil {
+			isolated.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+		}
+		isolated.TLSClientConfig.NextProtos = []string{"http/1.1"}
+		isolated.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+		isolated.ResponseHeaderTimeout = 15 * time.Second
+		isolated.MaxResponseHeaderBytes = 16 << 10
+		defer isolated.CloseIdleConnections()
+		relayClient.Transport = isolated
+		relayClient.Jar = nil
+		if relayClient.Timeout <= 0 || relayClient.Timeout > 120*time.Second {
+			relayClient.Timeout = 120 * time.Second
+		}
+		req = req.Clone(req.Context())
+		req.GetBody = nil
+		req.Close = true
+	}
 	if common2.DebugEnabled && req != nil && req.URL != nil {
 		policy := service.NormalizeHTTPTransportPolicy(info.ChannelSetting)
 		logger.LogDebug(c, "http transport select: host=%s protocol=%s shards=%d policy=%s",
@@ -486,6 +528,10 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	}
 
 	common2.SetContextKey(c, appconstant.ContextKeyUpstreamRequestOrigin, req.URL.Scheme+"://"+req.URL.Host)
+	if info.SingleAttempt != nil && !info.SingleAttempt.Begin() {
+		_ = req.Body.Close()
+		return nil, errors.New("physical dispatch already attempted")
+	}
 	resp, err := relayClient.Do(req)
 	if err != nil {
 		logger.LogError(c, common2.LogText("do request failed: %s", err.Error()))

@@ -92,6 +92,7 @@ type UpstreamUsageEvidence struct {
 
 type RelayInfo struct {
 	UpstreamUsageEvidence *UpstreamUsageEvidence `json:"-"`
+	SingleAttempt         *SingleAttempt         `json:"-"`
 
 	TokenId           int
 	TokenKey          string

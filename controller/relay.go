@@ -174,7 +174,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	relayInfo.RetryIndex = 0
 	relayInfo.LastError = nil
 
-	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
+	retryLimit := common.RetryTimes
+	if relayInfo.SingleAttempt != nil {
+		retryLimit = 0
+	}
+	for ; retryParam.GetRetry() <= retryLimit; retryParam.IncreaseRetry() {
 		relayInfo.StreamStatus = nil
 		relayInfo.UpstreamUsageEvidence = nil
 		relayInfo.PerformanceBusinessRejection = false
@@ -224,7 +228,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		newAPIError = service.NormalizeViolationFeeError(newAPIError)
 		relayInfo.LastError = newAPIError
 
-		decision := service.DecideRelayRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry())
+		decision := service.DecideRelayRetry(c, newAPIError, retryLimit-retryParam.GetRetry())
 		service.RecordPolicyFailure(c, channel.Id, newAPIError, decision)
 		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError, relayInfo)
 
