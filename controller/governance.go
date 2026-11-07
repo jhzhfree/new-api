@@ -30,18 +30,21 @@ import (
 const governanceContextKey = "internal_governance_execution"
 const governanceResponseLimit = 4 << 20
 
+var governanceRevision = regexp.MustCompile(`^[a-f0-9]{64}$`)
+
 var governanceIdentifier = regexp.MustCompile(`^[A-Za-z0-9_-]{16,64}$`)
 
 type governanceExecution struct {
-	binding         model.GovernanceBinding
-	journal         *model.GovernanceJournal
-	info            *relaycommon.RelayInfo
-	succeeded       bool
-	expectedChannel int
-	maxInputTokens  uint
-	maxTokens       uint
-	hasImages       bool
-	embedding       bool
+	binding          model.GovernanceBinding
+	journal          *model.GovernanceJournal
+	info             *relaycommon.RelayInfo
+	succeeded        bool
+	expectedRevision string
+	expectedChannel  int
+	maxInputTokens   uint
+	maxTokens        uint
+	hasImages        bool
+	embedding        bool
 }
 
 // GovernanceTransport runs before authentication. Forwarded headers cannot
@@ -173,13 +176,24 @@ func governanceAdmission(embedding bool) gin.HandlerFunc {
 			}
 			fingerprintPrefix += "embeddings\x00"
 		}
+		expectedRevision := ""
+		versions, revisions := c.Request.Header.Values("X-Aigw-Config-Version"), c.Request.Header.Values("X-Aigw-Channel-Revision")
+		if len(versions) > 0 || len(revisions) > 0 {
+			if len(versions) != 1 || versions[0] != "1" || len(revisions) != 1 || !governanceRevision.MatchString(revisions[0]) {
+				c.AbortWithStatus(400)
+				return
+			}
+			expectedRevision = revisions[0]
+			common.SetContextKey(c, constant.ContextKeyGovernanceRevisionExpected, expectedRevision)
+			fingerprintPrefix += "config-v1\x00" + expectedRevision + "\x00"
+		}
 		digest := sha256.Sum256(append([]byte(fingerprintPrefix), raw...))
 		journal, err := model.NewGovernanceJournal(model.DB)
 		if err != nil {
 			c.AbortWithStatus(http.StatusServiceUnavailable)
 			return
 		}
-		execution := &governanceExecution{embedding: embedding, maxInputTokens: uint(maxInput), hasImages: hasImages, maxTokens: maxTokens, expectedChannel: channelID, journal: journal, binding: model.GovernanceBinding{OwnerID: c.GetInt("id"), RequestID: requestIDs[0], AttemptID: attemptIDs[0], Fingerprint: hex.EncodeToString(digest[:])}}
+		execution := &governanceExecution{expectedRevision: expectedRevision, embedding: embedding, maxInputTokens: uint(maxInput), hasImages: hasImages, maxTokens: maxTokens, expectedChannel: channelID, journal: journal, binding: model.GovernanceBinding{OwnerID: c.GetInt("id"), RequestID: requestIDs[0], AttemptID: attemptIDs[0], Fingerprint: hex.EncodeToString(digest[:])}}
 		if journal.Prepare(c.Request.Context(), execution.binding) != nil {
 			c.AbortWithStatus(http.StatusConflict)
 			return
@@ -191,7 +205,7 @@ func governanceAdmission(embedding bool) gin.HandlerFunc {
 			c.Request.URL.Path = "/v1/embeddings"
 		}
 		original := c.Writer
-		buffered := &governanceWriter{ResponseWriter: original, header: make(http.Header), status: 200, size: -1, inputLimit: inputLimit, live: streamV2, binding: execution.binding}
+		buffered := &governanceWriter{ResponseWriter: original, header: make(http.Header), status: 200, size: -1, inputLimit: inputLimit, revision: expectedRevision, live: streamV2, binding: execution.binding}
 		c.Writer = buffered
 		defer func() { c.Writer = original }()
 		c.Next()
@@ -228,6 +242,10 @@ func governanceAdmission(embedding bool) gin.HandlerFunc {
 		}
 		original.Header().Set("Content-Type", buffered.header.Get("Content-Type"))
 		original.Header().Set("Cache-Control", "no-store")
+		if expectedRevision != "" {
+			original.Header().Set("X-Aigw-Config-Version", "1")
+			original.Header().Set("X-Aigw-Channel-Revision", expectedRevision)
+		}
 		if embedding {
 			original.Header().Set("X-Aigw-Protocol", "embeddings")
 		}
@@ -308,6 +326,7 @@ func governanceBodyMatches(body []byte, contentType string, evidence *relaycommo
 type governanceWriter struct {
 	gin.ResponseWriter
 	inputLimit              string
+	revision                string
 	header                  http.Header
 	body                    bytes.Buffer
 	status, size            int
@@ -356,6 +375,10 @@ func (w *governanceWriter) Write(p []byte) (int, error) {
 				w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
 				w.ResponseWriter.Header().Set("Cache-Control", "no-store")
 				w.ResponseWriter.Header().Set("Trailer", "X-Aigw-Completion")
+				if w.revision != "" {
+					w.ResponseWriter.Header().Set("X-Aigw-Config-Version", "1")
+					w.ResponseWriter.Header().Set("X-Aigw-Channel-Revision", w.revision)
+				}
 				if w.inputLimit != "" {
 					w.ResponseWriter.Header().Set("X-Aigw-Admission-Version", "2")
 					w.ResponseWriter.Header().Set("X-Aigw-Input-Limit", w.inputLimit)
@@ -405,6 +428,7 @@ func GovernanceEvents(c *gin.Context) {
 	c.Header("X-Aigw-Paging-Version", "1")
 	c.Header("X-Aigw-Admission-Version", "2")
 	c.Header("X-Aigw-Embeddings-Version", "1")
+	c.Header("X-Aigw-Config-Version", "1")
 	if len(events) == 100 {
 		c.Header("X-Aigw-Next-Cursor", events[len(events)-1].AttemptID)
 	}
@@ -570,4 +594,27 @@ func governanceInlineImages(payload map[string]json.RawMessage) (bool, bool) {
 		}
 	}
 	return count > 0, true
+}
+
+// GovernanceChannelConfiguration exposes only an authenticated configuration
+// commitment. Credentials, endpoint URLs and raw channel settings are never returned.
+func GovernanceChannelConfiguration(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil || id < 1 || strconv.Itoa(id) != c.Param("id") {
+		c.AbortWithStatus(400)
+		return
+	}
+	channel, err := model.GetChannelById(id, true)
+	if err != nil {
+		c.AbortWithStatus(404)
+		return
+	}
+	revision, err := model.GovernanceChannelRevision(channel)
+	if err != nil {
+		c.AbortWithStatus(503)
+		return
+	}
+	c.Header("X-Aigw-Config-Version", "1")
+	c.Header("Cache-Control", "no-store")
+	c.JSON(200, gin.H{"channel_id": id, "revision": revision, "enabled": channel.Status == common.ChannelStatusEnabled})
 }

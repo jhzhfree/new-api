@@ -22,6 +22,7 @@ func SetRelayRouter(router *gin.Engine) {
 	owner, _ := strconv.Atoi(os.Getenv("GOVERNANCE_SERVICE_USER_ID"))
 	if owner > 0 {
 		governance := router.Group("/internal/governance/v1", controller.GovernanceTransport(os.Getenv("GOVERNANCE_ALLOW_LOOPBACK_HTTP") == "true"), middleware.SystemPerformanceCheck(), middleware.TokenAuth(), controller.GovernancePrincipal(owner))
+		governance.GET("/channels/:id/revision", controller.GovernanceChannelConfiguration)
 		governance.GET("/events", controller.GovernanceEvents)
 		governance.GET("/events/after/:cursor", controller.GovernanceEvents)
 		governance.POST("/events/:id/ack", controller.GovernanceAcknowledge)

@@ -590,6 +590,23 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 		logTaskPluginChannelDecision(c, nil, modelName, "channel_rejected", "nil_channel")
 		return types.NewError(errors.New("channel is nil"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 	}
+	if common.GetContextKeyString(c, constant.ContextKeyGovernanceRevisionExpected) != "" {
+		snapshot, err := model.GovernanceChannelSnapshot(channel)
+		if err != nil {
+			return types.NewError(errors.New("governed channel snapshot unavailable"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
+		}
+		// Native multi-key polling can write ChannelInfo from its receiver.
+		// Never let an immutable approval snapshot overwrite live key status.
+		if snapshot.ChannelInfo.IsMultiKey {
+			return types.NewError(errors.New("governed multi-key channels require separate admission"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
+		}
+		revision, err := model.GovernanceChannelRevision(snapshot)
+		if err != nil {
+			return types.NewError(err, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
+		}
+		channel = snapshot
+		common.SetContextKey(c, constant.ContextKeyGovernanceRevisionActual, revision)
+	}
 	if expectedPlugin != "" && !channelMatchesExpectedTaskPlugin(c, channel, expectedPlugin) {
 		logTaskPluginChannelDecision(c, channel, modelName, "channel_rejected", "identity_mismatch")
 		return types.NewError(

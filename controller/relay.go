@@ -155,6 +155,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			if execution.embedding && relayInfo.ChannelType != constant.ChannelTypeOpenAI {
 				return errors.New("unsupported governed embedding channel")
 			}
+			if execution.expectedRevision != "" && common.GetContextKeyString(c, constant.ContextKeyGovernanceRevisionActual) != execution.expectedRevision {
+				return errors.New("governed channel configuration drift")
+			}
 			if err := relaycommon.ValidateGovernedDispatchConfig(relayInfo); err != nil {
 				return err
 			}

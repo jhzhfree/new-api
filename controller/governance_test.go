@@ -192,12 +192,39 @@ func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 	engine.Use(middleware.BodyStorageCleanup())
 	engine.POST("/v1/chat/completions", middleware.TokenAuth(), func(c *gin.Context) { c.Status(204) })
 	engine.POST("/internal/governance/v1/chat/completions", GovernanceTransport(true), middleware.TokenAuth(), GovernancePrincipal(user.Id), GovernanceAdmission(), middleware.Distribute(), func(c *gin.Context) { Relay(c, types.RelayFormatOpenAI) })
+	engine.GET("/internal/governance/v1/channels/:id/revision", GovernanceTransport(true), middleware.TokenAuth(), GovernancePrincipal(user.Id), GovernanceChannelConfiguration)
+	reviewedRevision := ""
+	for _, key := range []string{"invalid", token.Key} {
+		manifestRequest := httptest.NewRequest("GET", "/internal/governance/v1/channels/1/revision", nil)
+		manifestRequest.RemoteAddr = "127.0.0.1:1234"
+		manifestRequest.Header.Set("Authorization", "Bearer sk-"+key)
+		result := httptest.NewRecorder()
+		engine.ServeHTTP(result, manifestRequest)
+		if key == "invalid" {
+			require.Equal(t, 401, result.Code)
+			continue
+		}
+		require.Equal(t, 200, result.Code)
+		require.Equal(t, "no-store", result.Header().Get("Cache-Control"))
+		require.NotContains(t, result.Body.String(), "syntheticvendor")
+		require.NotContains(t, result.Body.String(), upstream.URL)
+		var value struct {
+			Revision string `json:"revision"`
+		}
+		require.NoError(t, common.Unmarshal(result.Body.Bytes(), &value))
+		require.Len(t, value.Revision, 64)
+		reviewedRevision = value.Revision
+	}
 	call := func(key, attempt string, channelOverride ...string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest("POST", "/internal/governance/v1/chat/completions", strings.NewReader(`{"model":"governance-model","messages":[{"role":"user","content":"synthetic"}],"max_tokens":8}`))
 		req.RemoteAddr = "127.0.0.1:1234"
 		req.Header.Set("Authorization", "Bearer sk-"+key)
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Aigw-Channel-Id", "1")
+		if reviewedRevision != "" {
+			req.Header.Set("X-Aigw-Config-Version", "1")
+			req.Header.Set("X-Aigw-Channel-Revision", reviewedRevision)
+		}
 		if len(channelOverride) > 0 {
 			req.Header.Set("X-Aigw-Channel-Id", channelOverride[0])
 		}
@@ -220,9 +247,11 @@ func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 	require.Equal(t, 200, out.Code, out.Body.String())
 	require.Equal(t, "1", out.Header().Get("X-Aigw-Evidence-Version"))
 	require.Equal(t, int32(1), calls.Load())
+	require.Equal(t, reviewedRevision, out.Header().Get("X-Aigw-Channel-Revision"))
 	duplicate := call(token.Key, "NativeAttempt12345")
 	require.Equal(t, 409, duplicate.Code)
 	require.Equal(t, int32(1), calls.Load())
+	reviewedRevision = ""
 	journal, err := model.NewGovernanceJournal(db)
 	require.NoError(t, err)
 	events, err := journal.Pending(context.Background(), user.Id, 100)
@@ -289,6 +318,42 @@ func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 			require.NoError(t, db.Model(&channel).Update(tc.field, "").Error)
 		})
 	}
+	// A valid review cannot authorize a different endpoint or credential.
+	configured, err := model.GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	reviewedRevision, err = model.GovernanceChannelRevision(configured)
+	require.NoError(t, err)
+
+	require.NoError(t, db.Model(&channel).Update("channel_info", `{"is_multi_key":true,"multi_key_size":1}`).Error)
+	multi, err := model.GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	multiRevision, err := model.GovernanceChannelRevision(multi)
+	require.NoError(t, err)
+	savedRevision := reviewedRevision
+	reviewedRevision = multiRevision
+	deniedMulti := call(token.Key, "MultiKey"+common.GetUUID())
+	require.Equal(t, 502, deniedMulti.Code)
+	require.Equal(t, int32(1), calls.Load())
+	require.NoError(t, db.Model(&channel).Update("channel_info", `{}`).Error)
+	reviewedRevision = savedRevision
+	for _, field := range []string{"key", "base_url"} {
+		original := configured.Key
+		changed := "synthetic-rotated"
+		if field == "base_url" {
+			original = *configured.BaseURL
+			changed = upstream.URL + "/unreviewed"
+		}
+		require.NoError(t, db.Model(&channel).Update(field, changed).Error)
+		attempt := "ConfigDrift" + common.GetUUID()
+		denied := call(token.Key, attempt)
+		require.Equal(t, 502, denied.Code, denied.Body.String())
+		require.Equal(t, int32(1), calls.Load())
+		row, err := journal.Get(context.Background(), user.Id, attempt)
+		require.NoError(t, err)
+		require.Equal(t, model.GovernanceCancelled, row.State)
+		require.NoError(t, db.Model(&channel).Update(field, original).Error)
+	}
+	reviewedRevision = ""
 	require.NoError(t, db.Model(&channel).Update("type", constant.ChannelTypeGemini).Error)
 	unsupported := call(token.Key, "UnsupportedAttempt12345")
 	require.Equal(t, 502, unsupported.Code)
