@@ -103,6 +103,7 @@ func sendStreamData(c *gin.Context, info *relaycommon.RelayInfo, data string, fo
 }
 
 func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
+	info.UpstreamUsageEvidence = nil
 	if resp == nil || resp.Body == nil {
 		logger.LogError(c, common.LogText("invalid response or response body"))
 		return nil, types.NewOpenAIError(fmt.Errorf("invalid response"), types.ErrorCodeBadResponse, http.StatusInternalServerError)
@@ -187,6 +188,10 @@ func OaiStreamHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Re
 		usage.CompletionTokens += toolCount * 7
 	}
 
+	outcome := info.StreamStatus.OutcomeSnapshot()
+	info.UpstreamUsageEvidence = captureUpstreamUsage([]byte(usageFrame),
+		outcome.EndReason == relaycommon.StreamEndReasonDone && !outcome.HasErrors &&
+			outcome.Response == relaycommon.ResponseOutcomeCompleted)
 	applyUsagePostProcessing(info, usage, common.StringToByteSlice(usageFrame))
 
 	for _, name := range streamFunctionCallNames {
@@ -251,6 +256,7 @@ func observeStreamChoices(info *relaycommon.RelayInfo, data string, seen map[str
 }
 
 func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Response) (*dto.Usage, *types.NewAPIError) {
+	info.UpstreamUsageEvidence = nil
 	defer service.CloseResponseBodyGracefully(resp)
 
 	var simpleResponse dto.OpenAITextResponse
@@ -305,6 +311,7 @@ func OpenaiHandler(c *gin.Context, info *relaycommon.RelayInfo, resp *http.Respo
 		forceFormat = true
 	}
 
+	info.UpstreamUsageEvidence = captureUpstreamUsage(responseBody, resp.StatusCode == http.StatusOK)
 	usageModified := false
 	if simpleResponse.Usage.PromptTokens == 0 {
 		completionTokens := simpleResponse.Usage.CompletionTokens

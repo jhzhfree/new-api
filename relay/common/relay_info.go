@@ -80,7 +80,19 @@ type TokenCountMeta struct {
 	estimatePromptTokens int
 }
 
+// UpstreamUsageEvidence contains only the original OpenAI-compatible usage facts.
+// It is deliberately separate from Usage: normal relay billing can estimate or
+// normalize Usage. This is not proof of exactly-once dispatch or durable settlement.
+type UpstreamUsageEvidence struct {
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
+	Complete         bool
+}
+
 type RelayInfo struct {
+	UpstreamUsageEvidence *UpstreamUsageEvidence `json:"-"`
+
 	TokenId           int
 	TokenKey          string
 	TokenGroup        string

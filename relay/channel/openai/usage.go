@@ -131,3 +131,33 @@ func extractLlamaCachedTokensFromBody(body []byte) (int, bool) {
 	}
 	return *payload.Timings.CachedTokens, true
 }
+
+// captureUpstreamUsage reads facts before any estimation or vendor normalization.
+// Missing, fractional, negative, oversized or inconsistent counters are not
+// evidence. Explicit zero is valid and differs from an omitted counter.
+func captureUpstreamUsage(body []byte, complete bool) *relaycommon.UpstreamUsageEvidence {
+	var payload struct {
+		Usage *struct {
+			Prompt     *int64 `json:"prompt_tokens"`
+			Completion *int64 `json:"completion_tokens"`
+			Total      *int64 `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := common.Unmarshal(body, &payload); err != nil || payload.Usage == nil {
+		return nil
+	}
+	u := payload.Usage
+	if u.Prompt == nil || u.Completion == nil || u.Total == nil {
+		return nil
+	}
+	const maxTokens = int64(1<<31 - 1)
+	if *u.Prompt < 0 || *u.Completion < 0 || *u.Total < 0 ||
+		*u.Prompt > maxTokens || *u.Completion > maxTokens || *u.Total > maxTokens ||
+		*u.Prompt+*u.Completion != *u.Total {
+		return nil
+	}
+	return &relaycommon.UpstreamUsageEvidence{
+		PromptTokens: int(*u.Prompt), CompletionTokens: int(*u.Completion),
+		TotalTokens: int(*u.Total), Complete: complete,
+	}
+}

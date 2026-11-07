@@ -29,6 +29,11 @@ func CloseResponseBodyGracefully(httpResponse *http.Response) {
 // ID). When the upstream header is X-Oneapi-Request-Id, the value is captured
 // into the Gin context for later logging.
 func ShouldCopyUpstreamHeader(c *gin.Context, k string, v []string) bool {
+	// Governance evidence belongs to this gateway, never to an upstream.
+	// Reserve the namespace even while the enterprise endpoint is disabled.
+	if strings.HasPrefix(strings.ToLower(k), "x-aigw-") {
+		return false
+	}
 	if strings.EqualFold(k, "Content-Length") {
 		return false
 	}
