@@ -145,6 +145,9 @@ func TestGovernanceNativeAuthenticatedRelay(t *testing.T) {
 	}
 }
 func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
+	previousTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = previousTimeout })
 	db := modelManagementDB(t, "sqlite", "")
 	common.IsMasterNode = true
 	require.NoError(t, model.InitDB())
@@ -167,12 +170,14 @@ func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 	require.NoError(t, db.Create(&token).Error)
 	var calls atomic.Int32
 	var omitCache atomic.Bool
+	var earlyInput bool
 	var includeTTL atomic.Bool
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		var sent struct {
 			MaxTokens uint `json:"max_tokens"`
+			Stream    bool `json:"stream"`
 		}
 		require.NoError(t, common.DecodeJson(r.Body, &sent))
 		require.Equal(t, uint(8), sent.MaxTokens)
@@ -180,6 +185,20 @@ func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 		if channelType == constant.ChannelTypeAnthropic {
 			require.Equal(t, "/v1/messages", r.URL.Path)
 			require.Equal(t, "syntheticvendor", r.Header.Get("x-api-key"))
+			if sent.Stream {
+				w.Header().Set("Content-Type", "text/event-stream")
+				for _, frame := range []string{
+					`{"type":"message_start","message":{"id":"msg_synthetic","type":"message","role":"assistant","model":"governance-model","content":[],"usage":{"input_tokens":2,"output_tokens":0,"cache_read_input_tokens":4,"cache_creation_input_tokens":5}}}`,
+					`{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`,
+					`{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"synthetic"}}`,
+					`{"type":"content_block_stop","index":0}`,
+					`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":3}}`,
+					`{"type":"message_stop"}`,
+				} {
+					_, _ = w.Write([]byte("data: " + frame + "\n\n"))
+				}
+				return
+			}
 			payload := `{"id":"synthetic","type":"message","role":"assistant","model":"governance-model","content":[{"type":"text","text":"synthetic"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3,"cache_read_input_tokens":4,"cache_creation_input_tokens":5}}`
 			if includeTTL.Load() {
 				payload = strings.Replace(payload, `"cache_creation_input_tokens":5`, `"cache_creation_input_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":3,"ephemeral_1h_input_tokens":2}`, 1)
@@ -229,7 +248,17 @@ func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 		reviewedRevision = value.Revision
 	}
 	call := func(key, attempt string, channelOverride ...string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest("POST", "/internal/governance/v1/chat/completions", strings.NewReader(`{"model":"governance-model","messages":[{"role":"user","content":"synthetic"}],"max_tokens":8}`))
+		body := `{"model":"governance-model","messages":[{"role":"user","content":"synthetic"}],"max_tokens":8}`
+		if earlyInput {
+			body = strings.TrimSuffix(body, "}") + `,"stream":true}`
+		}
+		req := httptest.NewRequest("POST", "/internal/governance/v1/chat/completions", strings.NewReader(body))
+		if earlyInput {
+			req.Header.Set("X-Aigw-Admission-Version", "2")
+			req.Header.Set("X-Aigw-Max-Input-Tokens", "128")
+			req.Header.Set("X-Aigw-Stream-Version", "2")
+			req.Header.Set("X-Aigw-Input-Evidence-Version", "1")
+		}
 		req.RemoteAddr = "127.0.0.1:1234"
 		req.Header.Set("Authorization", "Bearer sk-"+key)
 		req.Header.Set("Content-Type", "application/json")
@@ -464,16 +493,39 @@ func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 	legacy := call(token.Key, "LegacyTTL"+common.GetUUID())
 	require.Equal(t, 200, legacy.Code)
 	require.NotContains(t, legacy.Body.String(), "cached_creation_tokens_details")
+	earlyInput = true
+	beforeEarly := calls.Load()
+	earlyID := "EarlyUsage" + common.GetUUID()
+	result := call(token.Key, earlyID)
+	row, err := journal.Get(context.Background(), user.Id, earlyID)
+	require.NoError(t, err)
+	if channelType == constant.ChannelTypeAnthropic {
+		require.Equal(t, 200, result.Code, result.Body.String())
+		require.Equal(t, "1", result.Header().Get("X-Aigw-Input-Evidence-Version"))
+		require.JSONEq(t, `{"input_tokens":2,"output_tokens":0,"cache_read_input_tokens":4,"cache_creation_input_tokens":5}`, result.Header().Get("X-Aigw-Initial-Usage"))
+		require.Contains(t, result.Body.String(), "[DONE]")
+		require.Equal(t, model.GovernanceCompleted, row.State)
+		require.Equal(t, beforeEarly+1, calls.Load())
+	} else {
+		require.Equal(t, 502, result.Code)
+		require.Equal(t, beforeEarly, calls.Load())
+		require.Equal(t, model.GovernanceCancelled, row.State)
+	}
 
 }
 
 func TestGovernanceLiveStreamCommitsBeforeTerminal(t *testing.T) {
 	db := modelManagementDB(t, "sqlite", "")
 	require.NoError(t, db.AutoMigrate(&model.GovernanceAttempt{}, &model.GovernanceEvent{}))
-	for _, version := range []int{0, 1, 2} {
+	for _, scenario := range []int{0, 1, 2, 3, 4} {
+		version := scenario
+		early := scenario >= 3
+		if early {
+			version = 1
+		}
 		cache := version > 0
 		for _, complete := range []bool{true, false} {
-			t.Run(strconv.Itoa(version)+"/"+strconv.FormatBool(complete), func(t *testing.T) {
+			t.Run(strconv.Itoa(scenario)+"/"+strconv.FormatBool(complete), func(t *testing.T) {
 				release := make(chan struct{})
 				var once sync.Once
 				unblock := func() { once.Do(func() { close(release) }) }
@@ -484,11 +536,15 @@ func TestGovernanceLiveStreamCommitsBeforeTerminal(t *testing.T) {
 					value, _ := c.Get(governanceContextKey)
 					x := value.(*governanceExecution)
 					require.NoError(t, x.journal.Dispatch(c.Request.Context(), x.binding, 1, "synthetic"))
+					x.info = &relaycommon.RelayInfo{UpstreamInitialUsage: &relaycommon.UpstreamInitialUsage{InputTokens: 1, CacheReadTokens: 1}}
+					if scenario == 4 {
+						x.info.UpstreamInitialUsage.InputTokens = 2
+					}
 					c.Header("Content-Type", "text/event-stream")
 					_, _ = c.Writer.WriteString("data: {\"choices\":[]}\n\n")
 					c.Writer.Flush()
 					<-release
-					x.info = &relaycommon.RelayInfo{UpstreamUsageEvidence: &relaycommon.UpstreamUsageEvidence{CacheDetailsVersion: 1, CacheWriteTTLKnown: true, CacheReadTokens: 1, PromptTokens: 2, CompletionTokens: 3, TotalTokens: 5, Complete: complete}}
+					x.info.UpstreamUsageEvidence = &relaycommon.UpstreamUsageEvidence{CacheDetailsVersion: 1, CacheWriteTTLKnown: true, CacheReadTokens: 1, PromptTokens: 2, CompletionTokens: 3, TotalTokens: 5, Complete: complete}
 					x.succeeded = true
 					_, _ = c.Writer.WriteString("data: {\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}\n\ndata: [DONE]\n\n")
 				})
@@ -498,6 +554,13 @@ func TestGovernanceLiveStreamCommitsBeforeTerminal(t *testing.T) {
 				req, err := http.NewRequest("POST", server.URL, strings.NewReader(`{"model":"synthetic","messages":[],"max_tokens":8,"stream":true}`))
 				require.NoError(t, err)
 				req.Header.Set("X-Aigw-Stream-Version", "2")
+				if early {
+					req.Header.Set("X-Aigw-Input-Evidence-Version", "1")
+					req.Header.Set("X-Aigw-Admission-Version", "2")
+					req.Header.Set("X-Aigw-Max-Input-Tokens", "128")
+					req.Header.Set("X-Aigw-Config-Version", "1")
+					req.Header.Set("X-Aigw-Channel-Revision", strings.Repeat("a", 64))
+				}
 				if cache {
 					req.Header.Set("X-Aigw-Tariff-Version", strconv.Itoa(version))
 				}
@@ -512,6 +575,10 @@ func TestGovernanceLiveStreamCommitsBeforeTerminal(t *testing.T) {
 				}
 				defer res.Body.Close()
 				require.Equal(t, "2", res.Header.Get("X-Aigw-Evidence-Version"))
+				if early {
+					require.Equal(t, "1", res.Header.Get("X-Aigw-Input-Evidence-Version"))
+					require.NotEmpty(t, res.Header.Get("X-Aigw-Initial-Usage"))
+				}
 				reader := bufio.NewReader(res.Body)
 				first, err := reader.ReadString('\n')
 				require.NoError(t, err)
@@ -526,7 +593,7 @@ func TestGovernanceLiveStreamCommitsBeforeTerminal(t *testing.T) {
 				require.NoError(t, err)
 				after, err := journal.Get(context.Background(), 7, attempt)
 				require.NoError(t, err)
-				if complete {
+				if complete && scenario != 4 {
 					require.Equal(t, "completed", res.Trailer.Get("X-Aigw-Completion"))
 					require.Contains(t, string(tail), "[DONE]")
 					require.Equal(t, model.GovernanceCompleted, after.State)

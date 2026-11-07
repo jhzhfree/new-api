@@ -333,6 +333,7 @@ func HandleStreamFinalResponse(c *gin.Context, info *relaycommon.RelayInfo, clau
 
 func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.RelayInfo) (*dto.Usage, *types.NewAPIError) {
 	info.UpstreamUsageEvidence = nil
+	info.UpstreamInitialUsage = nil
 	evidence := &claudeUsageEvidence{}
 	claudeInfo := &ClaudeResponseInfo{
 		ResponseId:   helper.GetResponseID(c),
@@ -345,6 +346,9 @@ func ClaudeStreamHandler(c *gin.Context, resp *http.Response, info *relaycommon.
 	helper.StreamScannerHandler(c, resp, info, func(data string, sr *helper.StreamResult) {
 		if info.SingleAttempt != nil {
 			evidence.observe([]byte(data))
+			if info.UpstreamInitialUsage == nil {
+				info.UpstreamInitialUsage = evidence.initial()
+			}
 		}
 		err = HandleStreamResponseData(c, info, claudeInfo, data)
 		if err != nil {

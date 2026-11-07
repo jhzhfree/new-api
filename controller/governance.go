@@ -35,6 +35,7 @@ var governanceRevision = regexp.MustCompile(`^[a-f0-9]{64}$`)
 var governanceIdentifier = regexp.MustCompile(`^[A-Za-z0-9_-]{16,64}$`)
 
 type governanceExecution struct {
+	earlyInput       bool
 	binding          model.GovernanceBinding
 	journal          *model.GovernanceJournal
 	info             *relaycommon.RelayInfo
@@ -199,13 +200,22 @@ func governanceAdmission(embedding bool) gin.HandlerFunc {
 			tariffVersion, _ = strconv.Atoi(versions[0])
 			fingerprintPrefix += "tariff-v" + versions[0] + "\x00"
 		}
+		earlyInput := false
+		if versions := c.Request.Header.Values("X-Aigw-Input-Evidence-Version"); len(versions) > 0 {
+			if len(versions) != 1 || versions[0] != "1" || !streamV2 || !tariff || inputLimit == "" || expectedRevision == "" || hasImages || len(payload["tools"]) > 0 {
+				c.AbortWithStatus(400)
+				return
+			}
+			earlyInput = true
+			fingerprintPrefix += "input-evidence-v1\x00"
+		}
 		digest := sha256.Sum256(append([]byte(fingerprintPrefix), raw...))
 		journal, err := model.NewGovernanceJournal(model.DB)
 		if err != nil {
 			c.AbortWithStatus(http.StatusServiceUnavailable)
 			return
 		}
-		execution := &governanceExecution{tariff: tariff, expectedRevision: expectedRevision, embedding: embedding, maxInputTokens: uint(maxInput), hasImages: hasImages, maxTokens: maxTokens, expectedChannel: channelID, journal: journal, binding: model.GovernanceBinding{OwnerID: c.GetInt("id"), RequestID: requestIDs[0], AttemptID: attemptIDs[0], Fingerprint: hex.EncodeToString(digest[:])}}
+		execution := &governanceExecution{earlyInput: earlyInput, tariff: tariff, expectedRevision: expectedRevision, embedding: embedding, maxInputTokens: uint(maxInput), hasImages: hasImages, maxTokens: maxTokens, expectedChannel: channelID, journal: journal, binding: model.GovernanceBinding{OwnerID: c.GetInt("id"), RequestID: requestIDs[0], AttemptID: attemptIDs[0], Fingerprint: hex.EncodeToString(digest[:])}}
 		if journal.Prepare(c.Request.Context(), execution.binding) != nil {
 			c.AbortWithStatus(http.StatusConflict)
 			return
@@ -217,14 +227,14 @@ func governanceAdmission(embedding bool) gin.HandlerFunc {
 			c.Request.URL.Path = "/v1/embeddings"
 		}
 		original := c.Writer
-		buffered := &governanceWriter{tariff: tariff, tariffVersion: tariffVersion, ResponseWriter: original, header: make(http.Header), status: 200, size: -1, inputLimit: inputLimit, revision: expectedRevision, live: streamV2, binding: execution.binding}
+		buffered := &governanceWriter{execution: execution, tariff: tariff, tariffVersion: tariffVersion, ResponseWriter: original, header: make(http.Header), status: 200, size: -1, inputLimit: inputLimit, revision: expectedRevision, live: streamV2, binding: execution.binding}
 		c.Writer = buffered
 		defer func() { c.Writer = original }()
 		c.Next()
 		c.Writer = original
 		finish, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		if execution.info == nil || (tariff && (execution.info.UpstreamUsageEvidence == nil || execution.info.UpstreamUsageEvidence.CacheDetailsVersion != 1 || (tariffVersion == 2 && !execution.info.UpstreamUsageEvidence.CacheWriteTTLKnown))) || !execution.succeeded || buffered.failed || buffered.status != 200 || !governanceBodyMatches(buffered.body.Bytes(), buffered.header.Get("Content-Type"), execution.info.UpstreamUsageEvidence, embedding) {
+		if execution.info == nil || (earlyInput && !execution.info.UpstreamInitialUsage.Matches(execution.info.UpstreamUsageEvidence)) || (tariff && (execution.info.UpstreamUsageEvidence == nil || execution.info.UpstreamUsageEvidence.CacheDetailsVersion != 1 || (tariffVersion == 2 && !execution.info.UpstreamUsageEvidence.CacheWriteTTLKnown))) || !execution.succeeded || buffered.failed || buffered.status != 200 || !governanceBodyMatches(buffered.body.Bytes(), buffered.header.Get("Content-Type"), execution.info.UpstreamUsageEvidence, embedding) {
 			// Cancellation only succeeds if dispatch never happened. Otherwise the
 			// durable state stays unknown and the control plane must retain its hold.
 			_ = journal.Cancel(finish, execution.binding)
@@ -367,6 +377,7 @@ func governanceBodyMatches(body []byte, contentType string, evidence *relaycommo
 }
 
 type governanceWriter struct {
+	execution     *governanceExecution
 	tariff        bool
 	tariffVersion int
 	usageFrame    []byte
@@ -418,6 +429,20 @@ func (w *governanceWriter) Write(p []byte) (int, error) {
 				continue
 			}
 			if !w.started {
+				if w.execution != nil && w.execution.earlyInput {
+					info := w.execution.info
+					if info == nil || !info.UpstreamInitialUsage.Valid(w.execution.maxInputTokens, w.execution.maxTokens) {
+						w.failed = true
+						return 0, errors.New("missing original initial usage")
+					}
+					encoded, encodeErr := common.Marshal(info.UpstreamInitialUsage)
+					if encodeErr != nil {
+						w.failed = true
+						return 0, encodeErr
+					}
+					w.ResponseWriter.Header().Set("X-Aigw-Input-Evidence-Version", "1")
+					w.ResponseWriter.Header().Set("X-Aigw-Initial-Usage", string(encoded))
+				}
 				if w.tariff {
 					w.ResponseWriter.Header().Set("X-Aigw-Tariff-Version", strconv.Itoa(max(1, w.tariffVersion)))
 				}
@@ -495,6 +520,7 @@ func GovernanceEvents(c *gin.Context) {
 	c.Header("X-Aigw-Embeddings-Version", "1")
 	c.Header("X-Aigw-Tariff-Version", "1")
 	c.Header("X-Aigw-Tariff-Versions", "1,2")
+	c.Header("X-Aigw-Input-Evidence-Version", "1")
 	c.Header("X-Aigw-Config-Version", "1")
 	if len(events) == 100 {
 		c.Header("X-Aigw-Next-Cursor", events[len(events)-1].AttemptID)

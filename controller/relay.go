@@ -152,6 +152,9 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 				return errors.New("unsupported governed channel")
 			}
 
+			if execution.earlyInput && relayInfo.ChannelType != constant.ChannelTypeAnthropic {
+				return errors.New("unsupported governed initial usage channel")
+			}
 			if execution.embedding && relayInfo.ChannelType != constant.ChannelTypeOpenAI {
 				return errors.New("unsupported governed embedding channel")
 			}

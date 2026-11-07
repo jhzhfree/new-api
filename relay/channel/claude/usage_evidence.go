@@ -142,6 +142,12 @@ func (e *claudeUsageEvidence) observe(data []byte) {
 		e.bad = true
 	}
 }
+func (e *claudeUsageEvidence) initial() *relaycommon.UpstreamInitialUsage {
+	if e.bad || !e.started || e.delta || e.stopped {
+		return nil
+	}
+	return &relaycommon.UpstreamInitialUsage{InputTokens: e.input, OutputTokens: e.output, CacheReadTokens: e.read, CacheWriteTokens: e.write}
+}
 func (e *claudeUsageEvidence) result(complete bool) *relaycommon.UpstreamUsageEvidence {
 	if e.bad || !e.started || !e.delta || !e.stopped || !complete {
 		return nil

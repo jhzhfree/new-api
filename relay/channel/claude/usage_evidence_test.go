@@ -99,3 +99,28 @@ func TestClaudeCacheWriteTTLEvidence(t *testing.T) {
 	contradictory := strings.Replace(zero, `"cache_creation_input_tokens":0`, `"cache_creation_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":0}`, 1)
 	require.Nil(t, claudeJSONEvidence([]byte(contradictory)))
 }
+
+func TestClaudeInitialEvidenceIsNotSettlement(t *testing.T) {
+	e := &claudeUsageEvidence{}
+	require.Nil(t, e.initial())
+	e.observe([]byte(`{"type":"message_start","message":{"usage":{"input_tokens":2,"output_tokens":1,"cache_read_input_tokens":4,"cache_creation_input_tokens":5}}}`))
+	initial := e.initial()
+	require.NotNil(t, initial)
+	require.True(t, initial.Valid(128, 8))
+	require.Nil(t, e.result(true))
+	require.False(t, initial.Matches(e.result(true)))
+	require.False(t, initial.Valid(10, 8))
+	require.False(t, initial.Valid(128, 0))
+	e.observe([]byte(`{"type":"message_delta","usage":{"output_tokens":3}}`))
+	require.Nil(t, e.initial())
+	e.observe([]byte(`{"type":"message_stop"}`))
+	require.True(t, initial.Matches(e.result(true)))
+	require.EqualValues(t, 1, initial.OutputTokens)
+	e.input++
+	require.False(t, initial.Matches(e.result(true)))
+	for _, usage := range []string{`{"output_tokens":0}`, `{"input_tokens":2,"output_tokens":-1}`, `{"input_tokens":2,"output_tokens":0,"cache_creation_input_tokens":-1}`} {
+		invalid := &claudeUsageEvidence{}
+		invalid.observe([]byte(`{"type":"message_start","message":{"usage":` + usage + `}}`))
+		require.Nil(t, invalid.initial())
+	}
+}

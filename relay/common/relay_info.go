@@ -96,7 +96,28 @@ type UpstreamUsageEvidence struct {
 	Complete            bool
 }
 
+// UpstreamInitialUsage is provisional wire evidence for message_start only.
+// It never authorizes settlement; the final durable receipt remains mandatory.
+type UpstreamInitialUsage struct {
+	InputTokens      int64 `json:"input_tokens"`
+	OutputTokens     int64 `json:"output_tokens"`
+	CacheReadTokens  int64 `json:"cache_read_input_tokens"`
+	CacheWriteTokens int64 `json:"cache_creation_input_tokens"`
+}
+
+func (u *UpstreamInitialUsage) Valid(maxInput, maxOutput uint) bool {
+	if u == nil || u.InputTokens < 0 || u.OutputTokens < 0 || u.CacheReadTokens < 0 || u.CacheWriteTokens < 0 || u.InputTokens > 1000000000 || u.CacheReadTokens > 1000000000 || u.CacheWriteTokens > 1000000000 || u.OutputTokens > int64(maxOutput) {
+		return false
+	}
+	total := u.InputTokens + u.CacheReadTokens + u.CacheWriteTokens
+	return total > 0 && total <= int64(maxInput)
+}
+func (u *UpstreamInitialUsage) Matches(final *UpstreamUsageEvidence) bool {
+	return u != nil && final != nil && final.Complete && final.CacheDetailsVersion == 1 && int64(final.PromptTokens) == u.InputTokens+u.CacheReadTokens+u.CacheWriteTokens && final.CacheReadTokens == u.CacheReadTokens && final.CacheWriteTokens == u.CacheWriteTokens && int64(final.CompletionTokens) >= u.OutputTokens
+}
+
 type RelayInfo struct {
+	UpstreamInitialUsage  *UpstreamInitialUsage  `json:"-"`
 	UpstreamUsageEvidence *UpstreamUsageEvidence `json:"-"`
 	SingleAttempt         *SingleAttempt         `json:"-"`
 
