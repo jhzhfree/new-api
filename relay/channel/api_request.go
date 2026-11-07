@@ -475,15 +475,20 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 			baseTransport = http.DefaultTransport
 		}
 		transport, ok := baseTransport.(*http.Transport)
-		if !ok || transport == nil || transport.DialTLSContext != nil || transport.DialTLS != nil ||
-			(transport.TLSClientConfig != nil && transport.TLSClientConfig.InsecureSkipVerify) ||
-			req == nil || req.Method != http.MethodPost || req.Body == nil {
+		if !ok || transport == nil || req == nil || req.Method != http.MethodPost || req.Body == nil {
 			if req != nil && req.Body != nil {
 				_ = req.Body.Close()
 			}
 			return nil, errors.New("unsupported single-attempt HTTP transport")
 		}
+		// Clone synchronizes net/http's lazy transport initialization. Inspect
+		// only the resulting private configuration, never shared TLS fields.
 		isolated := transport.Clone()
+		if isolated.DialTLSContext != nil || isolated.DialTLS != nil ||
+			(isolated.TLSClientConfig != nil && isolated.TLSClientConfig.InsecureSkipVerify) {
+			_ = req.Body.Close()
+			return nil, errors.New("unsupported single-attempt HTTP transport")
+		}
 		isolated.DisableKeepAlives = true
 		isolated.ForceAttemptHTTP2 = false
 		isolated.Protocols = new(http.Protocols)
@@ -528,9 +533,11 @@ func doRequest(c *gin.Context, req *http.Request, info *common.RelayInfo) (*http
 	}
 
 	common2.SetContextKey(c, appconstant.ContextKeyUpstreamRequestOrigin, req.URL.Scheme+"://"+req.URL.Host)
-	if info.SingleAttempt != nil && !info.SingleAttempt.Begin() {
-		_ = req.Body.Close()
-		return nil, errors.New("physical dispatch already attempted")
+	if info.SingleAttempt != nil {
+		if err := info.SingleAttempt.Begin(); err != nil {
+			_ = req.Body.Close()
+			return nil, err
+		}
 	}
 	resp, err := relayClient.Do(req)
 	if err != nil {
