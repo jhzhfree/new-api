@@ -1,18 +1,22 @@
 package controller
 
 import (
+	"bufio"
 	"context"
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	"github.com/QuantumNous/new-api/middleware"
 	"github.com/QuantumNous/new-api/relaykit/types"
 	"github.com/QuantumNous/new-api/setting/ratio_setting"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/QuantumNous/new-api/model"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
@@ -244,4 +248,71 @@ func TestGovernanceNativeAuthenticatedRelay(t *testing.T) {
 	rejected = call(token.Key, "RevokedAttempt12345")
 	require.Equal(t, 401, rejected.Code)
 	require.Equal(t, int32(1), calls.Load())
+}
+
+func TestGovernanceLiveStreamCommitsBeforeTerminal(t *testing.T) {
+	db := modelManagementDB(t, "sqlite", "")
+	require.NoError(t, db.AutoMigrate(&model.GovernanceAttempt{}, &model.GovernanceEvent{}))
+	for _, complete := range []bool{true, false} {
+		t.Run(strconv.FormatBool(complete), func(t *testing.T) {
+			release := make(chan struct{})
+			var once sync.Once
+			unblock := func() { once.Do(func() { close(release) }) }
+			defer unblock()
+			r := gin.New()
+			r.Use(func(c *gin.Context) { c.Set("id", 7) })
+			r.POST("/", GovernanceAdmission(), func(c *gin.Context) {
+				value, _ := c.Get(governanceContextKey)
+				x := value.(*governanceExecution)
+				require.NoError(t, x.journal.Dispatch(c.Request.Context(), x.binding, 1, "synthetic"))
+				c.Header("Content-Type", "text/event-stream")
+				_, _ = c.Writer.WriteString("data: {\"choices\":[]}\n\n")
+				c.Writer.Flush()
+				<-release
+				x.info = &relaycommon.RelayInfo{UpstreamUsageEvidence: &relaycommon.UpstreamUsageEvidence{PromptTokens: 2, CompletionTokens: 3, TotalTokens: 5, Complete: complete}}
+				x.succeeded = true
+				_, _ = c.Writer.WriteString("data: {\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}\n\ndata: [DONE]\n\n")
+			})
+			server := httptest.NewServer(r)
+			defer func() { unblock(); server.Close() }()
+			attempt := "LiveStream" + common.GetUUID()
+			req, err := http.NewRequest("POST", server.URL, strings.NewReader(`{"model":"synthetic","messages":[],"max_tokens":8,"stream":true}`))
+			require.NoError(t, err)
+			req.Header.Set("X-Aigw-Stream-Version", "2")
+			req.Header.Set("X-Aigw-Channel-Id", "1")
+			req.Header.Set("X-Aigw-Request-Id", "Request_1234567890")
+			req.Header.Set("X-Aigw-Attempt-Id", attempt)
+			client := &http.Client{Timeout: 3 * time.Second}
+			res, err := client.Do(req)
+			if err != nil {
+				unblock()
+				t.Fatal(err)
+			}
+			defer res.Body.Close()
+			require.Equal(t, "2", res.Header.Get("X-Aigw-Evidence-Version"))
+			reader := bufio.NewReader(res.Body)
+			first, err := reader.ReadString('\n')
+			require.NoError(t, err)
+			require.Contains(t, first, "choices")
+			journal, err := model.NewGovernanceJournal(db)
+			require.NoError(t, err)
+			before, err := journal.Get(context.Background(), 7, attempt)
+			require.NoError(t, err)
+			require.Equal(t, model.GovernanceDispatched, before.State)
+			unblock()
+			tail, err := io.ReadAll(reader)
+			require.NoError(t, err)
+			after, err := journal.Get(context.Background(), 7, attempt)
+			require.NoError(t, err)
+			if complete {
+				require.Equal(t, "completed", res.Trailer.Get("X-Aigw-Completion"))
+				require.Contains(t, string(tail), "[DONE]")
+				require.Equal(t, model.GovernanceCompleted, after.State)
+			} else {
+				require.Empty(t, res.Trailer.Get("X-Aigw-Completion"))
+				require.NotContains(t, string(tail), "[DONE]")
+				require.Equal(t, model.GovernanceDispatched, after.State)
+			}
+		})
+	}
 }

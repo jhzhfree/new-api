@@ -65,8 +65,8 @@ func GovernancePrincipal(owner int) gin.HandlerFunc {
 	}
 }
 
-// GovernanceAdmission buffers governed responses until durable completion is
-// known. This bounded first version deliberately does not offer real-time SSE.
+// GovernanceAdmission supports buffered v1 and negotiated real-time SSE v2.
+// V2 releases content early, but DONE and the completion trailer require a durable commit.
 func GovernanceAdmission() gin.HandlerFunc {
 	slots := make(chan struct{}, 32)
 	return func(c *gin.Context) {
@@ -102,6 +102,12 @@ func GovernanceAdmission() gin.HandlerFunc {
 				return
 			}
 		}
+		var stream bool
+		if value := payload["stream"]; len(value) > 0 && common.Unmarshal(value, &stream) != nil {
+			c.AbortWithStatus(http.StatusBadRequest)
+			return
+		}
+		streamV2 := stream && c.GetHeader("X-Aigw-Stream-Version") == "2"
 		channelIDs := c.Request.Header.Values("X-Aigw-Channel-Id")
 		if len(channelIDs) != 1 {
 			c.AbortWithStatus(http.StatusBadRequest)
@@ -127,7 +133,7 @@ func GovernanceAdmission() gin.HandlerFunc {
 		c.Request.Body = io.NopCloser(bytes.NewReader(raw))
 		c.Request.URL.Path = "/v1/chat/completions"
 		original := c.Writer
-		buffered := &governanceWriter{ResponseWriter: original, header: make(http.Header), status: 200, size: -1}
+		buffered := &governanceWriter{ResponseWriter: original, header: make(http.Header), status: 200, size: -1, live: streamV2, binding: execution.binding}
 		c.Writer = buffered
 		defer func() { c.Writer = original }()
 		c.Next()
@@ -138,12 +144,28 @@ func GovernanceAdmission() gin.HandlerFunc {
 			// Cancellation only succeeds if dispatch never happened. Otherwise the
 			// durable state stays unknown and the control plane must retain its hold.
 			_ = journal.Cancel(finish, execution.binding)
-			c.AbortWithStatus(http.StatusBadGateway)
+			if buffered.started {
+				_, _ = original.Write([]byte("data: {\"error\":{\"code\":\"governance_incomplete\"}}\n\n"))
+				original.Flush()
+			} else {
+				c.AbortWithStatus(http.StatusBadGateway)
+			}
 			return
 		}
 		usage := execution.info.UpstreamUsageEvidence
 		if journal.Complete(finish, execution.binding, int64(usage.PromptTokens), int64(usage.CompletionTokens), int64(usage.TotalTokens)) != nil {
-			c.AbortWithStatus(http.StatusServiceUnavailable)
+			if buffered.started {
+				_, _ = original.Write([]byte("data: {\"error\":{\"code\":\"governance_commit_failed\"}}\n\n"))
+				original.Flush()
+			} else {
+				c.AbortWithStatus(http.StatusServiceUnavailable)
+			}
+			return
+		}
+		if buffered.started {
+			original.Header().Set("X-Aigw-Completion", "completed")
+			_, _ = original.Write([]byte("data: [DONE]\n\n"))
+			original.Flush()
 			return
 		}
 		original.Header().Set("Content-Type", buffered.header.Get("Content-Type"))
@@ -216,10 +238,13 @@ func governanceBodyMatches(body []byte, contentType string, evidence *relaycommo
 
 type governanceWriter struct {
 	gin.ResponseWriter
-	header       http.Header
-	body         bytes.Buffer
-	status, size int
-	failed       bool
+	header                  http.Header
+	body                    bytes.Buffer
+	status, size            int
+	failed                  bool
+	live, started, terminal bool
+	pending                 []byte
+	binding                 model.GovernanceBinding
 }
 
 func (w *governanceWriter) Header() http.Header { return w.header }
@@ -241,13 +266,50 @@ func (w *governanceWriter) Write(p []byte) (int, error) {
 	}
 	n, err := w.body.Write(p)
 	w.size += n
+	if err == nil && w.live && w.status == 200 && strings.HasPrefix(w.header.Get("Content-Type"), "text/event-stream") {
+		w.pending = append(w.pending, p...)
+		for {
+			index := bytes.IndexByte(w.pending, '\n')
+			if index < 0 {
+				break
+			}
+			line := w.pending[:index+1]
+			w.pending = w.pending[index+1:]
+			if strings.TrimSpace(string(line)) == "data: [DONE]" {
+				w.terminal = true
+				continue
+			}
+			if w.terminal {
+				continue
+			}
+			if !w.started {
+				w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
+				w.ResponseWriter.Header().Set("Cache-Control", "no-store")
+				w.ResponseWriter.Header().Set("Trailer", "X-Aigw-Completion")
+				for key, value := range map[string]string{"X-Aigw-Evidence-Version": "2", "X-Aigw-Request-Id": w.binding.RequestID, "X-Aigw-Attempt-Id": w.binding.AttemptID, "X-Aigw-Usage-Source": "upstream", "X-Aigw-Physical-Attempts": "1"} {
+					w.ResponseWriter.Header().Set(key, value)
+				}
+				w.ResponseWriter.WriteHeader(200)
+				w.started = true
+			}
+			if _, err = w.ResponseWriter.Write(line); err != nil {
+				w.failed = true
+				return 0, err
+			}
+		}
+	}
 	return n, err
 }
 func (w *governanceWriter) WriteString(s string) (int, error) { return w.Write([]byte(s)) }
 func (w *governanceWriter) Status() int                       { return w.status }
 func (w *governanceWriter) Size() int                         { return w.size }
 func (w *governanceWriter) Written() bool                     { return w.size >= 0 }
-func (w *governanceWriter) Flush()                            { w.WriteHeaderNow() }
+func (w *governanceWriter) Flush() {
+	w.WriteHeaderNow()
+	if w.started {
+		w.ResponseWriter.Flush()
+	}
+}
 func (w *governanceWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
 	return nil, nil, errors.New("governance does not support hijacking")
 }
