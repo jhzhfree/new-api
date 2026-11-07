@@ -8,14 +8,17 @@ import (
 // Evidence is collected from the provider wire data before converter estimates
 // or billing normalization. Anthropic input excludes cache reads and writes.
 type rawClaudeUsage struct {
-	Input       *int64           `json:"input_tokens"`
-	Output      *int64           `json:"output_tokens"`
-	Read        *int64           `json:"cache_read_input_tokens"`
-	Write       *int64           `json:"cache_creation_input_tokens"`
-	ServerTools map[string]int64 `json:"server_tool_use"`
+	Input       *int64            `json:"input_tokens"`
+	Output      *int64            `json:"output_tokens"`
+	Read        *int64            `json:"cache_read_input_tokens"`
+	Write       *int64            `json:"cache_creation_input_tokens"`
+	Creation    map[string]*int64 `json:"cache_creation"`
+	ServerTools map[string]int64  `json:"server_tool_use"`
 }
 type claudeUsageEvidence struct {
 	input, output, read, write   int64
+	five, hour                   int64
+	ttlKnown                     bool
 	started, delta, stopped, bad bool
 }
 
@@ -48,6 +51,37 @@ func (e *claudeUsageEvidence) update(u *rawClaudeUsage, initial bool) {
 	}
 	if u.Write != nil {
 		e.write = *u.Write
+	}
+	if u.Creation != nil {
+		var reported int64
+		for _, count := range u.Creation {
+			if count == nil || *count < 0 || *count > 1000000000 {
+				e.bad = true
+				return
+			}
+			reported += *count
+			if reported > e.write {
+				e.bad = true
+				return
+			}
+		}
+		five, hour := u.Creation["ephemeral_5m_input_tokens"], u.Creation["ephemeral_1h_input_tokens"]
+		e.ttlKnown = len(u.Creation) == 2 && five != nil && hour != nil
+		if e.ttlKnown {
+			if *five+*hour != e.write {
+				e.bad = true
+				return
+			}
+			e.five, e.hour = *five, *hour
+		}
+	}
+
+	if e.write == 0 {
+		e.five, e.hour = 0, 0
+		e.ttlKnown = true
+	}
+	if e.five+e.hour != e.write {
+		e.ttlKnown = false
 	}
 	e.output = *u.Output
 	if e.input+e.read+e.write+e.output > 1000000000 {
@@ -113,7 +147,7 @@ func (e *claudeUsageEvidence) result(complete bool) *relaycommon.UpstreamUsageEv
 		return nil
 	}
 	input := e.input + e.read + e.write
-	return &relaycommon.UpstreamUsageEvidence{CacheDetailsVersion: 1, CacheReadTokens: e.read, CacheWriteTokens: e.write, PromptTokens: int(input), CompletionTokens: int(e.output), TotalTokens: int(input + e.output), Complete: true}
+	return &relaycommon.UpstreamUsageEvidence{CacheDetailsVersion: 1, CacheReadTokens: e.read, CacheWriteTokens: e.write, CacheWriteTTLKnown: e.ttlKnown, CacheWrite5mTokens: e.five, CacheWrite1hTokens: e.hour, PromptTokens: int(input), CompletionTokens: int(e.output), TotalTokens: int(input + e.output), Complete: true}
 }
 func claudeJSONEvidence(data []byte) *relaycommon.UpstreamUsageEvidence {
 	var response struct {

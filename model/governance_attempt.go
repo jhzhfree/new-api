@@ -36,6 +36,8 @@ type GovernanceAttempt struct {
 	CacheDetailsVersion int    `gorm:"not null;default:0"`
 	CacheReadTokens     int64  `gorm:"not null;default:0"`
 	CacheWriteTokens    int64  `gorm:"not null;default:0"`
+	CacheWrite5mTokens  int64  `gorm:"column:cache_write_5m_tokens;not null;default:0" json:"CacheWrite5mTokens,omitempty"`
+	CacheWrite1hTokens  int64  `gorm:"column:cache_write_1h_tokens;not null;default:0" json:"CacheWrite1hTokens,omitempty"`
 	PromptTokens        int64
 	CompletionTokens    int64
 	TotalTokens         int64
@@ -55,6 +57,8 @@ type GovernanceEvent struct {
 	CacheDetailsVersion int    `gorm:"not null;default:0"`
 	CacheReadTokens     int64  `gorm:"not null;default:0"`
 	CacheWriteTokens    int64  `gorm:"not null;default:0"`
+	CacheWrite5mTokens  int64  `gorm:"column:cache_write_5m_tokens;not null;default:0" json:"CacheWrite5mTokens,omitempty"`
+	CacheWrite1hTokens  int64  `gorm:"column:cache_write_1h_tokens;not null;default:0" json:"CacheWrite1hTokens,omitempty"`
 	PromptTokens        int64
 	CompletionTokens    int64
 	TotalTokens         int64
@@ -118,11 +122,19 @@ func (j *GovernanceJournal) Complete(ctx context.Context, b GovernanceBinding, p
 // CompleteDetailed persists bounded original cache facts atomically with the outbox.
 // Version zero means unavailable, never an inferred zero-cache observation.
 func (j *GovernanceJournal) CompleteDetailed(ctx context.Context, b GovernanceBinding, prompt, completion, total int64, version int, read, write int64) error {
+	return j.CompleteMetered(ctx, b, prompt, completion, total, version, read, write, 0, 0)
+}
+
+// CompleteMetered atomically freezes original counts with optional TTL evidence.
+func (j *GovernanceJournal) CompleteMetered(ctx context.Context, b GovernanceBinding, prompt, completion, total int64, version int, read, write, five, hour int64) error {
 	const maxTokens = int64(1<<31 - 1)
 	if !b.valid() || prompt < 0 || completion < 0 || total < 0 || prompt > maxTokens || completion > maxTokens || total > maxTokens || prompt+completion != total {
 		return ErrGovernanceInvalid
 	}
-	if version < 0 || version > 1 || read < 0 || write < 0 || read > maxTokens || write > maxTokens || read+write > prompt || (version == 0 && (read != 0 || write != 0)) {
+	if version < 0 || version > 2 || read < 0 || write < 0 || read > maxTokens || write > maxTokens || read+write > prompt || (version == 0 && (read != 0 || write != 0)) {
+		return ErrGovernanceInvalid
+	}
+	if five < 0 || hour < 0 || five > maxTokens || hour > maxTokens || (version == 2 && five+hour != write) || (version != 2 && (five != 0 || hour != 0)) {
 		return ErrGovernanceInvalid
 	}
 	return j.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -134,7 +146,7 @@ func (j *GovernanceJournal) CompleteDetailed(ctx context.Context, b GovernanceBi
 			return ErrGovernanceConflict
 		}
 		if a.State == GovernanceCompleted {
-			if a.PromptTokens == prompt && a.CompletionTokens == completion && a.TotalTokens == total && a.CacheDetailsVersion == version && a.CacheReadTokens == read && a.CacheWriteTokens == write {
+			if a.PromptTokens == prompt && a.CompletionTokens == completion && a.TotalTokens == total && a.CacheDetailsVersion == version && a.CacheReadTokens == read && a.CacheWriteTokens == write && a.CacheWrite5mTokens == five && a.CacheWrite1hTokens == hour {
 				return nil
 			}
 			return ErrGovernanceConflict
@@ -143,14 +155,14 @@ func (j *GovernanceJournal) CompleteDetailed(ctx context.Context, b GovernanceBi
 			return ErrGovernanceConflict
 		}
 		result := tx.Model(&GovernanceAttempt{}).Where("id = ? AND state = ?", a.ID, GovernanceDispatched).
-			Updates(map[string]any{"state": GovernanceCompleted, "prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total, "cache_details_version": version, "cache_read_tokens": read, "cache_write_tokens": write})
+			Updates(map[string]any{"state": GovernanceCompleted, "prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": total, "cache_details_version": version, "cache_read_tokens": read, "cache_write_tokens": write, "cache_write_5m_tokens": five, "cache_write_1h_tokens": hour})
 		if result.Error != nil {
 			return result.Error
 		}
 		if result.RowsAffected != 1 {
 			return ErrGovernanceConflict
 		}
-		return tx.Create(&GovernanceEvent{AttemptID: a.ID, OwnerID: a.OwnerID, RequestID: a.RequestID, State: GovernanceCompleted, ChannelID: a.ChannelID, Model: a.Model, PromptTokens: prompt, CompletionTokens: completion, TotalTokens: total, CacheDetailsVersion: version, CacheReadTokens: read, CacheWriteTokens: write}).Error
+		return tx.Create(&GovernanceEvent{AttemptID: a.ID, OwnerID: a.OwnerID, RequestID: a.RequestID, State: GovernanceCompleted, ChannelID: a.ChannelID, Model: a.Model, PromptTokens: prompt, CompletionTokens: completion, TotalTokens: total, CacheDetailsVersion: version, CacheReadTokens: read, CacheWriteTokens: write, CacheWrite5mTokens: five, CacheWrite1hTokens: hour}).Error
 	})
 }
 

@@ -80,13 +80,16 @@ type TokenCountMeta struct {
 	estimatePromptTokens int
 }
 
-// UpstreamUsageEvidence contains only the original OpenAI-compatible usage facts.
+// UpstreamUsageEvidence contains original upstream facts in canonical token units.
 // It is deliberately separate from Usage: normal relay billing can estimate or
 // normalize Usage. This is not proof of exactly-once dispatch or durable settlement.
 type UpstreamUsageEvidence struct {
 	CacheDetailsVersion int
 	CacheReadTokens     int64
 	CacheWriteTokens    int64
+	CacheWriteTTLKnown  bool
+	CacheWrite5mTokens  int64
+	CacheWrite1hTokens  int64
 	PromptTokens        int
 	CompletionTokens    int
 	TotalTokens         int

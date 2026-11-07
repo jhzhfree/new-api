@@ -121,6 +121,26 @@ func TestGovernanceJournalDatabaseMatrix(t *testing.T) {
 				journal, err := model.NewGovernanceJournal(model.DB)
 				require.NoError(t, err)
 				ctx := context.Background()
+				var marker model.Option
+				markerErr := model.DB.Where(map[string]any{"key": "governance_cache_upgrade_marker"}).Take(&marker).Error
+				if markerErr == nil {
+					old, err := journal.Get(ctx, 94, "UpgradeTTLAttempt1234")
+					require.NoError(t, err)
+					require.Equal(t, 1, old.CacheDetailsVersion)
+					require.EqualValues(t, 5, old.CacheWriteTokens)
+					require.Zero(t, old.CacheWrite5mTokens)
+					require.Zero(t, old.CacheWrite1hTokens)
+					oldEvents, err := journal.Pending(ctx, 94, 100)
+					require.NoError(t, err)
+					require.Len(t, oldEvents, 1)
+					require.EqualValues(t, 14, oldEvents[0].TotalTokens)
+					require.EqualValues(t, 4, oldEvents[0].CacheReadTokens)
+					require.Zero(t, oldEvents[0].CacheWrite5mTokens)
+					require.Zero(t, oldEvents[0].CacheWrite1hTokens)
+				} else {
+					require.ErrorIs(t, markerErr, gorm.ErrRecordNotFound)
+				}
+
 				binding := model.GovernanceBinding{OwnerID: 7, AttemptID: strings.Repeat("a", 32), RequestID: strings.Repeat("b", 32), Fingerprint: strings.Repeat("c", 64)}
 				require.NoError(t, journal.Prepare(ctx, binding))
 				require.Error(t, journal.Prepare(ctx, binding))
@@ -283,6 +303,26 @@ func TestGovernanceJournalDatabaseMatrix(t *testing.T) {
 				if final.State == model.GovernanceDispatched {
 					require.Error(t, cancelErr)
 				}
+
+				ttl := binding
+				ttl.OwnerID = 93
+				ttl.AttemptID = "TTLMatrixAttempt1234"
+				require.NoError(t, journal.Prepare(ctx, ttl))
+				require.NoError(t, journal.Dispatch(ctx, ttl, 4, "synthetic-model"))
+				require.ErrorIs(t, journal.CompleteMetered(ctx, ttl, 11, 3, 14, 2, 4, 5, 3, 3), model.ErrGovernanceInvalid)
+				require.ErrorIs(t, journal.CompleteMetered(ctx, ttl, 11, 3, 14, 1, 4, 5, 3, 2), model.ErrGovernanceInvalid)
+				require.NoError(t, journal.CompleteMetered(ctx, ttl, 11, 3, 14, 2, 4, 5, 3, 2))
+				require.NoError(t, journal.CompleteMetered(ctx, ttl, 11, 3, 14, 2, 4, 5, 3, 2))
+				require.ErrorIs(t, journal.CompleteMetered(ctx, ttl, 11, 3, 14, 2, 4, 5, 2, 3), model.ErrGovernanceConflict)
+				require.NoError(t, model.DB.AutoMigrate(&model.GovernanceAttempt{}, &model.GovernanceEvent{})) // repeated migration preserves TTL facts
+				journal, err = model.NewGovernanceJournal(model.DB)
+				require.NoError(t, err)
+				ttlRows, err := journal.Pending(ctx, 93, 100)
+				require.NoError(t, err)
+				require.Len(t, ttlRows, 1)
+				require.Equal(t, 2, ttlRows[0].CacheDetailsVersion)
+				require.EqualValues(t, 3, ttlRows[0].CacheWrite5mTokens)
+				require.EqualValues(t, 2, ttlRows[0].CacheWrite1hTokens)
 				// More than one page, identical timestamps, an acknowledged cursor
 				// and owner isolation must all work on the real database engine.
 				var pending []model.GovernanceEvent

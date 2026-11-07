@@ -186,7 +186,8 @@ func captureUpstreamUsage(body []byte, complete bool) *relaycommon.UpstreamUsage
 	}
 	return &relaycommon.UpstreamUsageEvidence{
 		CacheDetailsVersion: version, CacheReadTokens: read, CacheWriteTokens: write,
-		PromptTokens: int(*u.Prompt), CompletionTokens: int(*u.Completion),
+		CacheWriteTTLKnown: version == 1 && write == 0,
+		PromptTokens:       int(*u.Prompt), CompletionTokens: int(*u.Completion),
 		TotalTokens: int(*u.Total), Complete: complete,
 	}
 }

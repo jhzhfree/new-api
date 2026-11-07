@@ -1,7 +1,9 @@
 package claude
 
 import (
+	"fmt"
 	"github.com/stretchr/testify/require"
+	"strings"
 	"testing"
 )
 
@@ -49,4 +51,51 @@ func TestClaudeRawUsageEvidence(t *testing.T) {
 	for _, raw := range []string{`{"type":"message","stop_reason":"end_turn","content":[{"type":"server_tool_use"}],"usage":{"input_tokens":2,"output_tokens":3}}`, `{"type":"message","usage":{"input_tokens":2,"output_tokens":3}}`, `{"type":"message","stop_reason":"end_turn","usage":{"input_tokens":2}}`, `{"type":"message","stop_reason":"end_turn","usage":{"input_tokens":1e30,"output_tokens":3}}`} {
 		require.Nil(t, claudeJSONEvidence([]byte(raw)))
 	}
+}
+
+func TestClaudeCacheWriteTTLEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name, creation string
+		known          bool
+		five, hour     int64
+	}{
+		{"mixed", `,"cache_creation":{"ephemeral_5m_input_tokens":3,"ephemeral_1h_input_tokens":2}`, true, 3, 2},
+		{"missing", "", false, 0, 0},
+		{"partial", `,"cache_creation":{"ephemeral_5m_input_tokens":5}`, false, 0, 0},
+		{"mismatch", `,"cache_creation":{"ephemeral_5m_input_tokens":3,"ephemeral_1h_input_tokens":3}`, false, 0, 0},
+		{"negative", `,"cache_creation":{"ephemeral_5m_input_tokens":-1,"ephemeral_1h_input_tokens":6}`, false, 0, 0},
+		{"oversized", `,"cache_creation":{"ephemeral_5m_input_tokens":1000000001,"ephemeral_1h_input_tokens":0}`, false, 0, 0},
+		{"unknown-duration", `,"cache_creation":{"ephemeral_5m_input_tokens":3,"ephemeral_1h_input_tokens":2,"future":0}`, false, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			usage := fmt.Sprintf(`{"input_tokens":2,"output_tokens":3,"cache_creation_input_tokens":5%s}`, tc.creation)
+			v := claudeJSONEvidence([]byte(`{"type":"message","stop_reason":"end_turn","usage":` + usage + `}`))
+			invalid := tc.name == "negative" || tc.name == "oversized" || tc.name == "mismatch"
+			if invalid {
+				require.Nil(t, v)
+			} else {
+				require.NotNil(t, v)
+				require.Equal(t, tc.known, v.CacheWriteTTLKnown)
+			}
+			if tc.known {
+				require.Equal(t, tc.five, v.CacheWrite5mTokens)
+				require.Equal(t, tc.hour, v.CacheWrite1hTokens)
+			}
+			e := &claudeUsageEvidence{}
+			e.observe([]byte(`{"type":"message_start","message":{"usage":` + usage + `}}`))
+			e.observe([]byte(`{"type":"message_delta","usage":{"output_tokens":4}}`))
+			e.observe([]byte(`{"type":"message_stop"}`))
+			streamed := e.result(true)
+			if invalid {
+				require.Nil(t, streamed)
+			} else {
+				require.NotNil(t, streamed)
+				require.Equal(t, tc.known, streamed.CacheWriteTTLKnown)
+			}
+		})
+	}
+	zero := `{"type":"message","stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3,"cache_creation_input_tokens":0}}`
+	require.True(t, claudeJSONEvidence([]byte(zero)).CacheWriteTTLKnown)
+	contradictory := strings.Replace(zero, `"cache_creation_input_tokens":0`, `"cache_creation_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":1,"ephemeral_1h_input_tokens":0}`, 1)
+	require.Nil(t, claudeJSONEvidence([]byte(contradictory)))
 }

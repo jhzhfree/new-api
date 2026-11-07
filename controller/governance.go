@@ -189,13 +189,15 @@ func governanceAdmission(embedding bool) gin.HandlerFunc {
 			fingerprintPrefix += "config-v1\x00" + expectedRevision + "\x00"
 		}
 		tariff := false
+		tariffVersion := 0
 		if versions := c.Request.Header.Values("X-Aigw-Tariff-Version"); len(versions) > 0 {
-			if len(versions) != 1 || versions[0] != "1" || embedding || (stream && !streamV2) {
+			if len(versions) != 1 || (versions[0] != "1" && versions[0] != "2") || embedding || (stream && !streamV2) {
 				c.AbortWithStatus(400)
 				return
 			}
 			tariff = true
-			fingerprintPrefix += "tariff-v1\x00"
+			tariffVersion, _ = strconv.Atoi(versions[0])
+			fingerprintPrefix += "tariff-v" + versions[0] + "\x00"
 		}
 		digest := sha256.Sum256(append([]byte(fingerprintPrefix), raw...))
 		journal, err := model.NewGovernanceJournal(model.DB)
@@ -215,14 +217,14 @@ func governanceAdmission(embedding bool) gin.HandlerFunc {
 			c.Request.URL.Path = "/v1/embeddings"
 		}
 		original := c.Writer
-		buffered := &governanceWriter{tariff: tariff, ResponseWriter: original, header: make(http.Header), status: 200, size: -1, inputLimit: inputLimit, revision: expectedRevision, live: streamV2, binding: execution.binding}
+		buffered := &governanceWriter{tariff: tariff, tariffVersion: tariffVersion, ResponseWriter: original, header: make(http.Header), status: 200, size: -1, inputLimit: inputLimit, revision: expectedRevision, live: streamV2, binding: execution.binding}
 		c.Writer = buffered
 		defer func() { c.Writer = original }()
 		c.Next()
 		c.Writer = original
 		finish, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		if execution.info == nil || (tariff && (execution.info.UpstreamUsageEvidence == nil || execution.info.UpstreamUsageEvidence.CacheDetailsVersion != 1)) || !execution.succeeded || buffered.failed || buffered.status != 200 || !governanceBodyMatches(buffered.body.Bytes(), buffered.header.Get("Content-Type"), execution.info.UpstreamUsageEvidence, embedding) {
+		if execution.info == nil || (tariff && (execution.info.UpstreamUsageEvidence == nil || execution.info.UpstreamUsageEvidence.CacheDetailsVersion != 1 || (tariffVersion == 2 && !execution.info.UpstreamUsageEvidence.CacheWriteTTLKnown))) || !execution.succeeded || buffered.failed || buffered.status != 200 || !governanceBodyMatches(buffered.body.Bytes(), buffered.header.Get("Content-Type"), execution.info.UpstreamUsageEvidence, embedding) {
 			// Cancellation only succeeds if dispatch never happened. Otherwise the
 			// durable state stays unknown and the control plane must retain its hold.
 			_ = journal.Cancel(finish, execution.binding)
@@ -239,11 +241,15 @@ func governanceAdmission(embedding bool) gin.HandlerFunc {
 		// semantics during data-plane-first upgrades. Details are opt-in.
 		detailVersion, readTokens, writeTokens := 0, int64(0), int64(0)
 		if tariff {
-			detailVersion = usage.CacheDetailsVersion
+			detailVersion = tariffVersion
 			readTokens = usage.CacheReadTokens
 			writeTokens = usage.CacheWriteTokens
 		}
-		if journal.CompleteDetailed(finish, execution.binding, int64(usage.PromptTokens), int64(usage.CompletionTokens), int64(usage.TotalTokens), detailVersion, readTokens, writeTokens) != nil {
+		five, hour := int64(0), int64(0)
+		if tariffVersion == 2 {
+			five, hour = usage.CacheWrite5mTokens, usage.CacheWrite1hTokens
+		}
+		if journal.CompleteMetered(finish, execution.binding, int64(usage.PromptTokens), int64(usage.CompletionTokens), int64(usage.TotalTokens), detailVersion, readTokens, writeTokens, five, hour) != nil {
 			if buffered.started {
 				_, _ = original.Write([]byte("data: {\"error\":{\"code\":\"governance_commit_failed\"}}\n\n"))
 				original.Flush()
@@ -254,7 +260,7 @@ func governanceAdmission(embedding bool) gin.HandlerFunc {
 		}
 		if buffered.started {
 			if tariff {
-				priced, err := governancePricedUsage(buffered.usageFrame, usage)
+				priced, err := governancePricedUsage(buffered.usageFrame, usage, tariffVersion)
 				if err != nil {
 					_, _ = original.Write([]byte("data: {\"error\":{\"code\":\"governance_usage_invalid\"}}\n\n"))
 					original.Flush()
@@ -268,14 +274,14 @@ func governanceAdmission(embedding bool) gin.HandlerFunc {
 			return
 		}
 		if tariff {
-			priced, err := governancePricedUsage(buffered.body.Bytes(), usage)
+			priced, err := governancePricedUsage(buffered.body.Bytes(), usage, tariffVersion)
 			if err != nil {
 				c.AbortWithStatus(502)
 				return
 			}
 			buffered.body.Reset()
 			_, _ = buffered.body.Write(priced)
-			original.Header().Set("X-Aigw-Tariff-Version", "1")
+			original.Header().Set("X-Aigw-Tariff-Version", strconv.Itoa(tariffVersion))
 		}
 		original.Header().Set("Content-Type", buffered.header.Get("Content-Type"))
 		original.Header().Set("Cache-Control", "no-store")
@@ -361,8 +367,9 @@ func governanceBodyMatches(body []byte, contentType string, evidence *relaycommo
 }
 
 type governanceWriter struct {
-	tariff     bool
-	usageFrame []byte
+	tariff        bool
+	tariffVersion int
+	usageFrame    []byte
 	gin.ResponseWriter
 	inputLimit              string
 	revision                string
@@ -412,7 +419,7 @@ func (w *governanceWriter) Write(p []byte) (int, error) {
 			}
 			if !w.started {
 				if w.tariff {
-					w.ResponseWriter.Header().Set("X-Aigw-Tariff-Version", "1")
+					w.ResponseWriter.Header().Set("X-Aigw-Tariff-Version", strconv.Itoa(max(1, w.tariffVersion)))
 				}
 				w.ResponseWriter.Header().Set("Content-Type", "text/event-stream")
 				w.ResponseWriter.Header().Set("Cache-Control", "no-store")
@@ -487,6 +494,7 @@ func GovernanceEvents(c *gin.Context) {
 	c.Header("X-Aigw-Admission-Version", "2")
 	c.Header("X-Aigw-Embeddings-Version", "1")
 	c.Header("X-Aigw-Tariff-Version", "1")
+	c.Header("X-Aigw-Tariff-Versions", "1,2")
 	c.Header("X-Aigw-Config-Version", "1")
 	if len(events) == 100 {
 		c.Header("X-Aigw-Next-Cursor", events[len(events)-1].AttemptID)
@@ -679,7 +687,10 @@ func GovernanceChannelConfiguration(c *gin.Context) {
 }
 
 // Canonical cache facts come from original upstream usage, not converter estimates.
-func governancePricedUsage(raw []byte, usage *relaycommon.UpstreamUsageEvidence) ([]byte, error) {
+func governancePricedUsage(raw []byte, usage *relaycommon.UpstreamUsageEvidence, version int) ([]byte, error) {
+	if version < 1 || version > 2 || (version == 2 && (usage == nil || !usage.CacheWriteTTLKnown)) {
+		return nil, errors.New("missing governed cache TTL evidence")
+	}
 	if usage == nil || usage.CacheDetailsVersion != 1 {
 		return nil, errors.New("missing governed cache evidence")
 	}
@@ -687,9 +698,13 @@ func governancePricedUsage(raw []byte, usage *relaycommon.UpstreamUsageEvidence)
 	if common.Unmarshal(raw, &response) != nil || response == nil {
 		return nil, errors.New("invalid governed response")
 	}
+	details := map[string]any{"cached_tokens": usage.CacheReadTokens, "cached_creation_tokens": usage.CacheWriteTokens}
+	if version == 2 {
+		details["cached_creation_tokens_details"] = map[string]int64{"ephemeral_5m_input_tokens": usage.CacheWrite5mTokens, "ephemeral_1h_input_tokens": usage.CacheWrite1hTokens}
+	}
 	encoded, err := common.Marshal(map[string]any{
 		"prompt_tokens": usage.PromptTokens, "completion_tokens": usage.CompletionTokens, "total_tokens": usage.TotalTokens,
-		"prompt_tokens_details": map[string]int64{"cached_tokens": usage.CacheReadTokens, "cached_creation_tokens": usage.CacheWriteTokens},
+		"prompt_tokens_details": details,
 	})
 	if err != nil {
 		return nil, err

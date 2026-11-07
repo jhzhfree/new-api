@@ -59,6 +59,24 @@ func main() {
 	if err != nil || model.DB.Create(&model.Option{Key: "governance_upgrade_manifest", Value: string(manifest)}).Error != nil {
 		os.Exit(8)
 	}
+	// The release baseline predates governance. Feature-branch baselines also
+	// seed a real v1 receipt without referring to newer Go model fields.
+	if model.DB.Migrator().HasTable("governance_attempts") {
+		attempt := map[string]any{"id": "UpgradeTTLAttempt1234", "owner_id": 94, "request_id": "UpgradeTTLRequest1234", "fingerprint": strings.Repeat("a", 64), "state": "completed", "channel_id": 4, "model": "synthetic-model", "prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14, "cache_details_version": 1, "cache_read_tokens": 4, "cache_write_tokens": 5, "created_at": 1234, "updated_at": 1234}
+		if model.DB.Table("governance_attempts").Create(attempt).Error != nil {
+			os.Exit(14)
+		}
+		// GORM may add dialect-specific return keys (SQLite adds @id) to a
+		// Create(map). Never reuse that mutated map for another table.
+		event := map[string]any{"attempt_id": "UpgradeTTLAttempt1234", "owner_id": 94, "request_id": "UpgradeTTLRequest1234", "state": "completed", "channel_id": 4, "model": "synthetic-model", "prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14, "cache_details_version": 1, "cache_read_tokens": 4, "cache_write_tokens": 5, "created_at": 1234, "acknowledged_at": 0}
+		if model.DB.Table("governance_events").Create(event).Error != nil {
+			os.Exit(15)
+		}
+
+		if model.DB.Create(&model.Option{Key: "governance_cache_upgrade_marker", Value: "v1"}).Error != nil {
+			os.Exit(16)
+		}
+	}
 	db, err := model.DB.DB()
 	if err != nil {
 		os.Exit(3)

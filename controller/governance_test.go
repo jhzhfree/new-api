@@ -167,6 +167,7 @@ func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 	require.NoError(t, db.Create(&token).Error)
 	var calls atomic.Int32
 	var omitCache atomic.Bool
+	var includeTTL atomic.Bool
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
@@ -179,7 +180,11 @@ func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 		if channelType == constant.ChannelTypeAnthropic {
 			require.Equal(t, "/v1/messages", r.URL.Path)
 			require.Equal(t, "syntheticvendor", r.Header.Get("x-api-key"))
-			_, _ = w.Write([]byte(`{"id":"synthetic","type":"message","role":"assistant","model":"governance-model","content":[{"type":"text","text":"synthetic"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3,"cache_read_input_tokens":4,"cache_creation_input_tokens":5}}`))
+			payload := `{"id":"synthetic","type":"message","role":"assistant","model":"governance-model","content":[{"type":"text","text":"synthetic"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3,"cache_read_input_tokens":4,"cache_creation_input_tokens":5}}`
+			if includeTTL.Load() {
+				payload = strings.Replace(payload, `"cache_creation_input_tokens":5`, `"cache_creation_input_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":3,"ephemeral_1h_input_tokens":2}`, 1)
+			}
+			_, _ = w.Write([]byte(payload))
 			return
 		}
 		require.Equal(t, "Bearer syntheticvendor", r.Header.Get("Authorization"))
@@ -200,6 +205,7 @@ func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 	engine.POST("/internal/governance/v1/chat/completions", GovernanceTransport(true), middleware.TokenAuth(), GovernancePrincipal(user.Id), GovernanceAdmission(), middleware.Distribute(), func(c *gin.Context) { Relay(c, types.RelayFormatOpenAI) })
 	engine.GET("/internal/governance/v1/channels/:id/revision", GovernanceTransport(true), middleware.TokenAuth(), GovernancePrincipal(user.Id), GovernanceChannelConfiguration)
 	tariff := true
+	tariffVersion := "1"
 	reviewedRevision := ""
 	for _, key := range []string{"invalid", token.Key} {
 		manifestRequest := httptest.NewRequest("GET", "/internal/governance/v1/channels/1/revision", nil)
@@ -228,7 +234,7 @@ func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 		req.Header.Set("Authorization", "Bearer sk-"+key)
 		req.Header.Set("Content-Type", "application/json")
 		if tariff {
-			req.Header.Set("X-Aigw-Tariff-Version", "1")
+			req.Header.Set("X-Aigw-Tariff-Version", tariffVersion)
 		}
 		req.Header.Set("X-Aigw-Channel-Id", "1")
 		if reviewedRevision != "" {
@@ -421,14 +427,53 @@ func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 		require.Equal(t, before+1, calls.Load())
 	}
 
+	// TTL evidence is opt-in; a positive aggregate without a duration is unknown.
+	require.NoError(t, db.Model(&channel).Update("key", "disabled-secret\nsyntheticvendor").Error)
+	reviewed, err := model.GetChannelById(channel.Id, true)
+	require.NoError(t, err)
+	reviewedRevision, err = model.GovernanceChannelRevision(reviewed)
+	require.NoError(t, err)
+	tariff, tariffVersion = true, "2"
+	if channelType == constant.ChannelTypeAnthropic {
+		missingID := "MissingTTL" + common.GetUUID()
+		before := calls.Load()
+		missing := call(token.Key, missingID)
+		require.Equal(t, 502, missing.Code)
+		require.Equal(t, before+1, calls.Load())
+		unknown, err := journal.Get(context.Background(), user.Id, missingID)
+		require.NoError(t, err)
+		require.Equal(t, model.GovernanceDispatched, unknown.State)
+	}
+	includeTTL.Store(true)
+	ttlAttempt := "TTLAttempt" + common.GetUUID()
+	ttlResult := call(token.Key, ttlAttempt)
+	require.Equal(t, 200, ttlResult.Code, ttlResult.Body.String())
+	require.Equal(t, "2", ttlResult.Header().Get("X-Aigw-Tariff-Version"))
+	require.Contains(t, ttlResult.Body.String(), "cached_creation_tokens_details")
+	ttlRow, err := journal.Get(context.Background(), user.Id, ttlAttempt)
+	require.NoError(t, err)
+	require.Equal(t, 2, ttlRow.CacheDetailsVersion)
+	if channelType == constant.ChannelTypeAnthropic {
+		require.EqualValues(t, 3, ttlRow.CacheWrite5mTokens)
+		require.EqualValues(t, 2, ttlRow.CacheWrite1hTokens)
+	} else {
+		require.Zero(t, ttlRow.CacheWrite5mTokens)
+		require.Zero(t, ttlRow.CacheWrite1hTokens)
+	}
+	tariffVersion = "1"
+	legacy := call(token.Key, "LegacyTTL"+common.GetUUID())
+	require.Equal(t, 200, legacy.Code)
+	require.NotContains(t, legacy.Body.String(), "cached_creation_tokens_details")
+
 }
 
 func TestGovernanceLiveStreamCommitsBeforeTerminal(t *testing.T) {
 	db := modelManagementDB(t, "sqlite", "")
 	require.NoError(t, db.AutoMigrate(&model.GovernanceAttempt{}, &model.GovernanceEvent{}))
-	for _, cache := range []bool{false, true} {
+	for _, version := range []int{0, 1, 2} {
+		cache := version > 0
 		for _, complete := range []bool{true, false} {
-			t.Run(strconv.FormatBool(cache)+"/"+strconv.FormatBool(complete), func(t *testing.T) {
+			t.Run(strconv.Itoa(version)+"/"+strconv.FormatBool(complete), func(t *testing.T) {
 				release := make(chan struct{})
 				var once sync.Once
 				unblock := func() { once.Do(func() { close(release) }) }
@@ -443,7 +488,7 @@ func TestGovernanceLiveStreamCommitsBeforeTerminal(t *testing.T) {
 					_, _ = c.Writer.WriteString("data: {\"choices\":[]}\n\n")
 					c.Writer.Flush()
 					<-release
-					x.info = &relaycommon.RelayInfo{UpstreamUsageEvidence: &relaycommon.UpstreamUsageEvidence{CacheDetailsVersion: 1, CacheReadTokens: 1, PromptTokens: 2, CompletionTokens: 3, TotalTokens: 5, Complete: complete}}
+					x.info = &relaycommon.RelayInfo{UpstreamUsageEvidence: &relaycommon.UpstreamUsageEvidence{CacheDetailsVersion: 1, CacheWriteTTLKnown: true, CacheReadTokens: 1, PromptTokens: 2, CompletionTokens: 3, TotalTokens: 5, Complete: complete}}
 					x.succeeded = true
 					_, _ = c.Writer.WriteString("data: {\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}\n\ndata: [DONE]\n\n")
 				})
@@ -454,7 +499,7 @@ func TestGovernanceLiveStreamCommitsBeforeTerminal(t *testing.T) {
 				require.NoError(t, err)
 				req.Header.Set("X-Aigw-Stream-Version", "2")
 				if cache {
-					req.Header.Set("X-Aigw-Tariff-Version", "1")
+					req.Header.Set("X-Aigw-Tariff-Version", strconv.Itoa(version))
 				}
 				req.Header.Set("X-Aigw-Channel-Id", "1")
 				req.Header.Set("X-Aigw-Request-Id", "Request_1234567890")
@@ -487,7 +532,11 @@ func TestGovernanceLiveStreamCommitsBeforeTerminal(t *testing.T) {
 					require.Equal(t, model.GovernanceCompleted, after.State)
 					if cache {
 						require.Contains(t, string(tail), `"cached_tokens":1`)
-						require.Equal(t, 1, after.CacheDetailsVersion)
+						require.Equal(t, version, after.CacheDetailsVersion)
+						if version == 2 {
+							require.Contains(t, string(tail), "cached_creation_tokens_details")
+							require.Equal(t, "2", res.Header.Get("X-Aigw-Tariff-Version"))
+						}
 						require.EqualValues(t, 1, after.CacheReadTokens)
 					}
 				} else {
