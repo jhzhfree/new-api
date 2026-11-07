@@ -35,7 +35,7 @@ jobs:
           go build -mod=readonly -o "$RUNNER_TEMP/newapi-baseline-migrate" "$GITHUB_WORKSPACE/scripts/testdata/governance_baseline/main.go"
           echo "TEST_GOVERNANCE_BASELINE_BINARY=$RUNNER_TEMP/newapi-baseline-migrate" >> "$GITHUB_ENV"
       - name: Race-check execution boundary and service regressions
-        run: go test -race ./model ./relay/common ./relay/channel ./relay/channel/openai ./service -count=1
+        run: go test -race ./common ./model ./relay/common ./relay/channel ./relay/channel/openai ./service -count=1
       - name: Controller race regressions
         run: go test -race ./controller -count=1 -timeout=15m
       - name: Build validation binary (not a release package)
@@ -43,3 +43,4 @@ jobs:
           mkdir -p web/dist
           touch web/dist/index.html
           go build -mod=readonly .
+          go build -mod=readonly -o "$RUNNER_TEMP/newapi-governance-server" ./scripts/testdata/governance_server

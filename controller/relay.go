@@ -137,6 +137,22 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		return
 	}
 
+	if value, ok := c.Get(governanceContextKey); ok {
+		execution := value.(*governanceExecution)
+		execution.info = relayInfo
+		relayInfo.SingleAttempt, err = relaycommon.NewDurableSingleAttempt(func() error {
+			if relayInfo.ChannelMeta == nil || relayInfo.ChannelType != constant.ChannelTypeOpenAI {
+				return errors.New("unsupported governed channel")
+			}
+
+			return execution.journal.Dispatch(c.Request.Context(), execution.binding, relayInfo.ChannelId, relayInfo.OriginModelName)
+		})
+		if err != nil {
+			return
+		}
+		defer func() { execution.succeeded = newAPIError == nil }()
+	}
+
 	defer func() {
 		recovered := recover()
 		resultErr := newAPIError
@@ -188,6 +204,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if channelErr != nil {
 			logger.LogError(c, channelErr.Error())
 			newAPIError = channelErr
+			break
+		}
+		if relayInfo.SingleAttempt != nil && channel.Type != constant.ChannelTypeOpenAI {
+			newAPIError = types.NewErrorWithStatusCode(errors.New("unsupported governed channel"), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 			break
 		}
 		service.AppendUsedChannel(c, channel.Id)

@@ -19,7 +19,7 @@ const (
 
 var ErrGovernanceConflict = errors.New("governance attempt conflict")
 var ErrGovernanceInvalid = errors.New("invalid governance attempt")
-var governanceID = regexp.MustCompile(`^[a-z0-9_-]{16,64}$`)
+var governanceID = regexp.MustCompile(`^[A-Za-z0-9_-]{16,64}$`)
 var governanceDigest = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 // GovernanceAttempt stores execution facts, never credentials or prompt content.

@@ -202,13 +202,25 @@ func main() {
 		port = strconv.Itoa(*common.Port)
 	}
 
+	tlsConfig, tlsErr := common.LoadServerTLS(os.Getenv("SERVER_TLS_CERT_FILE"), os.Getenv("SERVER_TLS_KEY_FILE"))
+	if tlsErr != nil {
+		common.FatalLog(tlsErr.Error())
+		return
+	}
 	srv := &http.Server{
-		Addr:    ":" + port,
-		Handler: server,
+		Addr:      ":" + port,
+		TLSConfig: tlsConfig,
+		Handler:   server,
 	}
 
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		var err error
+		if tlsConfig != nil {
+			err = srv.ListenAndServeTLS("", "")
+		} else {
+			err = srv.ListenAndServe()
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			common.FatalLog(common.LogText("failed to start HTTP server: %s", err.Error()))
 		}
 	}()

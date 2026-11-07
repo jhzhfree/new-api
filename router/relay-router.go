@@ -1,6 +1,8 @@
 package router
 
 import (
+	"os"
+	"strconv"
 	"strings"
 
 	"github.com/QuantumNous/new-api/constant"
@@ -17,6 +19,13 @@ func SetRelayRouter(router *gin.Engine) {
 	router.Use(middleware.DecompressRequestMiddleware())
 	router.Use(middleware.BodyStorageCleanup()) // 清理请求体存储
 	router.Use(middleware.StatsMiddleware())
+	owner, _ := strconv.Atoi(os.Getenv("GOVERNANCE_SERVICE_USER_ID"))
+	if owner > 0 {
+		governance := router.Group("/internal/governance/v1", controller.GovernanceTransport(os.Getenv("GOVERNANCE_ALLOW_LOOPBACK_HTTP") == "true"), middleware.SystemPerformanceCheck(), middleware.TokenAuth(), controller.GovernancePrincipal(owner))
+		governance.GET("/events", controller.GovernanceEvents)
+		governance.POST("/events/:id/ack", controller.GovernanceAcknowledge)
+		governance.POST("/chat/completions", controller.GovernanceAdmission(), middleware.ModelRequestRateLimit(), middleware.Distribute(), func(c *gin.Context) { controller.Relay(c, types.RelayFormatOpenAI) })
+	}
 	// https://platform.openai.com/docs/api-reference/introduction
 	modelsRouter := router.Group("/v1/models")
 	modelsRouter.Use(middleware.RouteTag("relay"))
