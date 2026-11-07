@@ -233,6 +233,26 @@ func TestGovernanceJournalDatabaseMatrix(t *testing.T) {
 				assert.Equal(t, model.GovernanceCancelled, attempt.State)
 				_, err = journal.Get(ctx, 8, binding.AttemptID)
 				require.Error(t, err)
+
+				racing := binding
+				racing.AttemptID = strings.Repeat("f", 32)
+				require.NoError(t, journal.Prepare(ctx, racing))
+				start := make(chan struct{})
+				cancelResult := make(chan error, 1)
+				dispatchResult := make(chan error, 1)
+				go func() { <-start; cancelResult <- journal.Cancel(ctx, racing) }()
+				go func() { <-start; dispatchResult <- journal.Dispatch(ctx, racing, 4, "synthetic-model") }()
+				close(start)
+				cancelErr, dispatchErr := <-cancelResult, <-dispatchResult
+				require.False(t, cancelErr == nil && dispatchErr == nil, "refund proof must never coexist with dispatch")
+				final, err := journal.Get(ctx, 7, racing.AttemptID)
+				require.NoError(t, err)
+				if final.State == model.GovernanceCancelled {
+					require.Error(t, dispatchErr)
+				}
+				if final.State == model.GovernanceDispatched {
+					require.Error(t, cancelErr)
+				}
 				_, err = journal.Pending(ctx, 7, 0)
 				require.ErrorIs(t, err, model.ErrGovernanceInvalid)
 				sqlDB, err = model.DB.DB()

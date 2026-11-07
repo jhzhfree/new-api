@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -27,10 +28,11 @@ const governanceResponseLimit = 4 << 20
 var governanceIdentifier = regexp.MustCompile(`^[A-Za-z0-9_-]{16,64}$`)
 
 type governanceExecution struct {
-	binding   model.GovernanceBinding
-	journal   *model.GovernanceJournal
-	info      *relaycommon.RelayInfo
-	succeeded bool
+	binding         model.GovernanceBinding
+	journal         *model.GovernanceJournal
+	info            *relaycommon.RelayInfo
+	succeeded       bool
+	expectedChannel int
 }
 
 // GovernanceTransport runs before authentication. Forwarded headers cannot
@@ -100,13 +102,23 @@ func GovernanceAdmission() gin.HandlerFunc {
 				return
 			}
 		}
-		digest := sha256.Sum256(raw)
+		channelIDs := c.Request.Header.Values("X-Aigw-Channel-Id")
+		if len(channelIDs) != 1 {
+			c.AbortWithStatus(http.StatusBadRequest)
+			return
+		}
+		channelID, err := strconv.Atoi(channelIDs[0])
+		if err != nil || channelID <= 0 || strconv.Itoa(channelID) != channelIDs[0] {
+			c.AbortWithStatus(http.StatusBadRequest)
+			return
+		}
+		digest := sha256.Sum256(append([]byte(channelIDs[0]+"\x00"), raw...))
 		journal, err := model.NewGovernanceJournal(model.DB)
 		if err != nil {
 			c.AbortWithStatus(http.StatusServiceUnavailable)
 			return
 		}
-		execution := &governanceExecution{journal: journal, binding: model.GovernanceBinding{OwnerID: c.GetInt("id"), RequestID: requestIDs[0], AttemptID: attemptIDs[0], Fingerprint: hex.EncodeToString(digest[:])}}
+		execution := &governanceExecution{expectedChannel: channelID, journal: journal, binding: model.GovernanceBinding{OwnerID: c.GetInt("id"), RequestID: requestIDs[0], AttemptID: attemptIDs[0], Fingerprint: hex.EncodeToString(digest[:])}}
 		if journal.Prepare(c.Request.Context(), execution.binding) != nil {
 			c.AbortWithStatus(http.StatusConflict)
 			return
@@ -260,6 +272,41 @@ func GovernanceAcknowledge(c *gin.Context) {
 	journal, err := model.NewGovernanceJournal(model.DB)
 	if err != nil || journal.Acknowledge(c.Request.Context(), c.GetInt("id"), c.Param("id")) != nil {
 		c.AbortWithStatus(409)
+		return
+	}
+	c.Status(204)
+}
+
+// GovernanceCancel atomically fences an absent/prepared attempt. A dispatched
+// attempt cannot be declared unexecuted, even if its client has timed out.
+func GovernanceCancel(c *gin.Context) {
+	raw, err := io.ReadAll(io.LimitReader(c.Request.Body, 1025))
+	if err != nil || len(raw) > 1024 {
+		c.AbortWithStatus(400)
+		return
+	}
+	var payload struct {
+		RequestID   string `json:"request_id"`
+		Fingerprint string `json:"fingerprint"`
+	}
+	if common.Unmarshal(raw, &payload) != nil {
+		c.AbortWithStatus(400)
+		return
+	}
+	journal, err := model.NewGovernanceJournal(model.DB)
+	if err != nil {
+		c.AbortWithStatus(503)
+		return
+	}
+	binding := model.GovernanceBinding{OwnerID: c.GetInt("id"), RequestID: payload.RequestID, AttemptID: c.Param("id"), Fingerprint: payload.Fingerprint}
+	if err := journal.Cancel(c.Request.Context(), binding); err != nil {
+		if errors.Is(err, model.ErrGovernanceConflict) {
+			c.AbortWithStatus(409)
+		} else if errors.Is(err, model.ErrGovernanceInvalid) {
+			c.AbortWithStatus(400)
+		} else {
+			c.AbortWithStatus(503)
+		}
 		return
 	}
 	c.Status(204)

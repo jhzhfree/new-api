@@ -85,6 +85,7 @@ func TestGovernanceAdmissionEvidenceAndReplay(t *testing.T) {
 			})
 			for iteration := range 2 {
 				req := httptest.NewRequest("POST", "/", strings.NewReader(`{"model":"synthetic","messages":[],"max_tokens":8}`))
+				req.Header.Set("X-Aigw-Channel-Id", "1")
 				req.Header.Set("X-Aigw-Request-Id", "Request_1234567890")
 				req.Header.Set("X-Aigw-Attempt-Id", mode+"_Attempt1234567890")
 				out := httptest.NewRecorder()
@@ -160,11 +161,15 @@ func TestGovernanceNativeAuthenticatedRelay(t *testing.T) {
 	engine := gin.New()
 	engine.Use(middleware.BodyStorageCleanup())
 	engine.POST("/internal/governance/v1/chat/completions", GovernanceTransport(true), middleware.TokenAuth(), GovernancePrincipal(user.Id), GovernanceAdmission(), middleware.Distribute(), func(c *gin.Context) { Relay(c, types.RelayFormatOpenAI) })
-	call := func(key, attempt string) *httptest.ResponseRecorder {
+	call := func(key, attempt string, channelOverride ...string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest("POST", "/internal/governance/v1/chat/completions", strings.NewReader(`{"model":"governance-model","messages":[{"role":"user","content":"synthetic"}],"max_tokens":8}`))
 		req.RemoteAddr = "127.0.0.1:1234"
 		req.Header.Set("Authorization", "Bearer sk-"+key)
 		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Aigw-Channel-Id", "1")
+		if len(channelOverride) > 0 {
+			req.Header.Set("X-Aigw-Channel-Id", channelOverride[0])
+		}
 		req.Header.Set("X-Aigw-Request-Id", "Request_1234567890")
 		req.Header.Set("X-Aigw-Attempt-Id", attempt)
 		out := httptest.NewRecorder()
@@ -188,6 +193,12 @@ func TestGovernanceNativeAuthenticatedRelay(t *testing.T) {
 	require.Len(t, events, 1)
 	require.Equal(t, int64(5), events[0].TotalTokens)
 
+	mismatch := call(token.Key, "MismatchedAttempt12345", "2")
+	require.Equal(t, 502, mismatch.Code)
+	require.Equal(t, int32(1), calls.Load())
+	mismatched, err := journal.Get(context.Background(), user.Id, "MismatchedAttempt12345")
+	require.NoError(t, err)
+	require.Equal(t, model.GovernanceCancelled, mismatched.State)
 	require.NoError(t, db.Model(&channel).Update("type", constant.ChannelTypeAnthropic).Error)
 	unsupported := call(token.Key, "UnsupportedAttempt12345")
 	require.Equal(t, 502, unsupported.Code)

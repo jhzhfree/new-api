@@ -210,6 +210,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			newAPIError = types.NewErrorWithStatusCode(errors.New("unsupported governed channel"), types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
 			break
 		}
+		if value, ok := c.Get(governanceContextKey); ok && value.(*governanceExecution).expectedChannel != channel.Id {
+			newAPIError = types.NewErrorWithStatusCode(errors.New("governed channel binding changed"), types.ErrorCodeInvalidRequest, http.StatusConflict, types.ErrOptionWithSkipRetry())
+			break
+		}
 		service.AppendUsedChannel(c, channel.Id)
 		if billingErr := service.PrepareTieredBillingForSelectedGroup(c, relayInfo); billingErr != nil {
 			newAPIError = billingErr
