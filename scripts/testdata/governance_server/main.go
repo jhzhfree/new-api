@@ -71,6 +71,13 @@ func main() {
 			os.Exit(13)
 		}
 		channel := model.Channel{Name: "synthetic", Type: channelType, Key: "syntheticvendor", Status: common.ChannelStatusEnabled, Group: "default", Models: "governance-model", BaseURL: &base}
+		if mode := os.Getenv("GOVERNANCE_FIXTURE_MULTIKEY"); mode != "" {
+			if mode != "random" && mode != "polling" {
+				os.Exit(14)
+			}
+			channel.Key = "disabled-synthetic\nsyntheticvendor-one\nsyntheticvendor-two"
+			channel.ChannelInfo = model.ChannelInfo{IsMultiKey: true, MultiKeySize: 3, MultiKeyMode: constant.MultiKeyMode(mode), MultiKeyStatusList: map[int]int{0: common.ChannelStatusManuallyDisabled}}
+		}
 		if model.DB.Create(&user).Error != nil || model.DB.Create(&token).Error != nil || model.DB.Create(&channel).Error != nil {
 			os.Exit(5)
 		}

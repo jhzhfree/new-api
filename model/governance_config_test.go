@@ -2,8 +2,10 @@ package model
 
 import (
 	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/constant"
 	"github.com/stretchr/testify/require"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -53,5 +55,58 @@ func TestGovernanceChannelRevision(t *testing.T) {
 	for _, invalid := range []*Channel{nil, {}, {Id: 1, Key: strings.Repeat("x", (1<<20)+1)}, {Id: 1, Key: "x", OtherSettings: `null`}} {
 		_, err := GovernanceChannelRevision(invalid)
 		require.Error(t, err)
+	}
+}
+
+func TestGovernanceMultiKeySelection(t *testing.T) {
+	c := &Channel{Id: 76543, Key: "disabled\nfirst\nsecond", ChannelInfo: ChannelInfo{IsMultiKey: true, MultiKeySize: 3, MultiKeyMode: constant.MultiKeyModePolling, MultiKeyStatusList: map[int]int{0: 2}, MultiKeyPollingIndex: 99}}
+	revision, err := GovernanceChannelRevision(c)
+	require.NoError(t, err)
+	before, err := common.Marshal(c)
+	require.NoError(t, err)
+	counts := make(chan int, 200)
+	var wg sync.WaitGroup
+	for range 200 {
+		wg.Go(func() {
+			key, index, err := GovernanceChannelKey(c, revision)
+			if err != nil || (key != "first" && key != "second") {
+				counts <- -1
+				return
+			}
+			counts <- index
+		})
+	}
+	wg.Wait()
+	close(counts)
+	got := map[int]int{}
+	for index := range counts {
+		got[index]++
+	}
+	require.Equal(t, map[int]int{1: 100, 2: 100}, got)
+	after, err := common.Marshal(c)
+	require.NoError(t, err)
+	require.Equal(t, string(before), string(after), "scheduler mutated reviewed configuration")
+	c.ChannelInfo.MultiKeyMode = constant.MultiKeyModeRandom
+	for range 100 {
+		key, index, err := GovernanceChannelKey(c, revision)
+		require.NoError(t, err)
+		require.Contains(t, []int{1, 2}, index)
+		require.Contains(t, []string{"first", "second"}, key)
+	}
+	for name, change := range map[string]func(*Channel){
+		"size":     func(c *Channel) { c.ChannelInfo.MultiKeySize = 4 },
+		"empty":    func(c *Channel) { c.Key = "disabled\n\nsecond" },
+		"header":   func(c *Channel) { c.Key = "disabled\nfirst\r\nsecond" },
+		"mode":     func(c *Channel) { c.ChannelInfo.MultiKeyMode = "other" },
+		"index":    func(c *Channel) { c.ChannelInfo.MultiKeyStatusList[4] = 1 },
+		"disabled": func(c *Channel) { c.ChannelInfo.MultiKeyStatusList = map[int]int{0: 2, 1: 2, 2: 2} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			copy, err := common.DeepCopy(c)
+			require.NoError(t, err)
+			change(copy)
+			_, _, err = GovernanceChannelKey(copy, revision)
+			require.Error(t, err)
+		})
 	}
 }

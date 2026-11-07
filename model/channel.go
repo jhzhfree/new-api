@@ -673,6 +673,7 @@ func CleanupChannelPollingLocks() {
 		channelId := key.(int)
 		if !activeChannelSet[channelId] {
 			channelPollingLocks.Delete(channelId)
+			governanceKeyCursors.Delete(channelId)
 		}
 		return true
 	})

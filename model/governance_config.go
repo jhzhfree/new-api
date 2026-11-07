@@ -5,6 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"math/rand/v2"
+	"strings"
+	"sync"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
@@ -75,4 +78,71 @@ func GovernanceChannelRevision(channel *Channel) (string, error) {
 	_, _ = hash.Write([]byte("aigw-channel-config-v1\x00"))
 	_, _ = hash.Write(raw)
 	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// Scheduling is deliberately independent of native ChannelInfo persistence.
+// A revision change or process restart resets local round-robin ordering.
+var governanceKeyCursors sync.Map
+
+type governanceKeyCursor struct {
+	mu       sync.Mutex
+	revision string
+	next     int
+}
+
+// GovernanceChannelKey selects from an owned, reviewed snapshot without mutating
+// channel status, the snapshot, or persistent configuration. No retry is granted.
+func GovernanceChannelKey(channel *Channel, revision string) (string, int, error) {
+	if channel == nil || channel.Id <= 0 || len(revision) != 64 {
+		return "", 0, errors.New("invalid governed key selection")
+	}
+	if !channel.ChannelInfo.IsMultiKey {
+		return channel.Key, 0, nil
+	}
+	// Governed providers accept newline-separated bearer credentials, not JSON
+	// service-account arrays. Never use the cached Keys slice as authority.
+	if strings.HasPrefix(strings.TrimSpace(channel.Key), "[") {
+		return "", 0, errors.New("unsupported governed key format")
+	}
+	keys := strings.Split(strings.Trim(channel.Key, "\n"), "\n")
+	if len(keys) == 0 || len(keys) > 1024 || channel.ChannelInfo.MultiKeySize != len(keys) {
+		return "", 0, errors.New("invalid governed key count")
+	}
+	enabled := make([]int, 0, len(keys))
+	for i, key := range keys {
+		if key == "" || strings.ContainsAny(key, " \t\r\n") {
+			return "", 0, errors.New("invalid governed key format")
+		}
+		status, exists := channel.ChannelInfo.MultiKeyStatusList[i]
+		if !exists || status == common.ChannelStatusEnabled {
+			enabled = append(enabled, i)
+		}
+	}
+	for i := range channel.ChannelInfo.MultiKeyStatusList {
+		if i < 0 || i >= len(keys) {
+			return "", 0, errors.New("invalid governed key status index")
+		}
+	}
+	if len(enabled) == 0 {
+		return "", 0, errors.New("no enabled governed key")
+	}
+	var index int
+	switch channel.ChannelInfo.MultiKeyMode {
+	case constant.MultiKeyModeRandom:
+		index = enabled[rand.IntN(len(enabled))]
+	case constant.MultiKeyModePolling:
+		value, _ := governanceKeyCursors.LoadOrStore(channel.Id, &governanceKeyCursor{})
+		cursor := value.(*governanceKeyCursor)
+		cursor.mu.Lock()
+		if cursor.revision != revision {
+			cursor.revision = revision
+			cursor.next = 0
+		}
+		index = enabled[cursor.next%len(enabled)]
+		cursor.next = (cursor.next + 1) % len(enabled)
+		cursor.mu.Unlock()
+	default:
+		return "", 0, errors.New("unsupported governed key mode")
+	}
+	return keys[index], index, nil
 }

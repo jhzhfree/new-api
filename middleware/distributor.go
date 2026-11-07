@@ -595,11 +595,6 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 		if err != nil {
 			return types.NewError(errors.New("governed channel snapshot unavailable"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
 		}
-		// Native multi-key polling can write ChannelInfo from its receiver.
-		// Never let an immutable approval snapshot overwrite live key status.
-		if snapshot.ChannelInfo.IsMultiKey {
-			return types.NewError(errors.New("governed multi-key channels require separate admission"), types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
-		}
 		revision, err := model.GovernanceChannelRevision(snapshot)
 		if err != nil {
 			return types.NewError(err, types.ErrorCodeGetChannelFailed, types.ErrOptionWithSkipRetry())
@@ -685,9 +680,20 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
 	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
 
-	key, index, newAPIError := channel.GetNextEnabledKey()
-	if newAPIError != nil {
-		return newAPIError
+	var key string
+	var index int
+	if revision := common.GetContextKeyString(c, constant.ContextKeyGovernanceRevisionActual); revision != "" {
+		var err error
+		key, index, err = model.GovernanceChannelKey(channel, revision)
+		if err != nil {
+			return types.NewError(err, types.ErrorCodeChannelNoAvailableKey, types.ErrOptionWithSkipRetry())
+		}
+	} else {
+		var newAPIError *types.NewAPIError
+		key, index, newAPIError = channel.GetNextEnabledKey()
+		if newAPIError != nil {
+			return newAPIError
+		}
 	}
 	if channel.ChannelInfo.IsMultiKey {
 		common.SetContextKey(c, constant.ContextKeyChannelIsMultiKey, true)

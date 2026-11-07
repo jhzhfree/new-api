@@ -182,6 +182,7 @@ func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 			_, _ = w.Write([]byte(`{"id":"synthetic","type":"message","role":"assistant","model":"governance-model","content":[{"type":"text","text":"synthetic"}],"stop_reason":"end_turn","usage":{"input_tokens":2,"output_tokens":3,"cache_read_input_tokens":4,"cache_creation_input_tokens":5}}`))
 			return
 		}
+		require.Equal(t, "Bearer syntheticvendor", r.Header.Get("Authorization"))
 		payload := `{"id":"synthetic","object":"chat.completion","model":"governance-model","choices":[{"index":0,"message":{"role":"assistant","content":"synthetic"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5,"prompt_tokens_details":{"cached_tokens":1,"cached_creation_tokens":0}}}`
 		if omitCache.Load() {
 			payload = strings.ReplaceAll(payload, `,"prompt_tokens_details":{"cached_tokens":1,"cached_creation_tokens":0}`, "")
@@ -389,6 +390,35 @@ func testGovernanceNativeAuthenticatedRelay(t *testing.T, channelType int) {
 		row, err := journal.Get(context.Background(), user.Id, attempt)
 		require.NoError(t, err)
 		require.Equal(t, model.GovernanceDispatched, row.State)
+	}
+
+	// Governed selection must skip disabled credentials without rewriting status.
+	require.NoError(t, db.Model(&channel).Update("type", channelType).Error)
+	require.NoError(t, db.Model(&token).Update("status", common.TokenStatusEnabled).Error)
+	omitCache.Store(false)
+	for _, mode := range []string{"random", "polling"} {
+		info := `{"is_multi_key":true,"multi_key_size":2,"multi_key_mode":"` + mode + `","multi_key_status_list":{"0":2},"multi_key_polling_index":99}`
+		require.NoError(t, db.Model(&channel).Updates(map[string]any{"key": "disabled-secret\nsyntheticvendor", "channel_info": info}).Error)
+		multi, err := model.GetChannelById(channel.Id, true)
+		require.NoError(t, err)
+		reviewedRevision, err = model.GovernanceChannelRevision(multi)
+		require.NoError(t, err)
+		before := calls.Load()
+		attempt := "MultiAllowed" + common.GetUUID()
+		result := call(token.Key, attempt)
+		require.Equal(t, 200, result.Code, result.Body.String())
+		require.Equal(t, before+1, calls.Load())
+		replay := call(token.Key, attempt)
+		require.NotEqual(t, 200, replay.Code)
+		require.Equal(t, before+1, calls.Load())
+		persisted, err := model.GetChannelById(channel.Id, true)
+		require.NoError(t, err)
+		require.Equal(t, 99, persisted.ChannelInfo.MultiKeyPollingIndex)
+		require.Equal(t, 2, persisted.ChannelInfo.MultiKeyStatusList[0])
+		require.NoError(t, db.Model(&channel).Update("key", "disabled-secret\nrotated-secret").Error)
+		denied := call(token.Key, "MultiDrift"+common.GetUUID())
+		require.Equal(t, 502, denied.Code)
+		require.Equal(t, before+1, calls.Load())
 	}
 
 }
